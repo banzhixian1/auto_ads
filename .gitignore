@@ -1,0 +1,24 @@
+# 代码初始化相关
+__pycache__/
+*.code-workspace
+.vscode/
+
+# 文件夹
+log/
+logs/
+config/
+configs/
+data/
+archive/
+
+# 打包相关
+build/
+dist/
+*.spec
+*.lnk
+
+# 自定义其他文件
+test.py
+test.ipynb
+temp.py
+temp.ipynb

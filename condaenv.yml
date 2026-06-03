@@ -1,0 +1,9 @@
+name: project_template
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - requests>=2.32.5
+  - sqlalchemy>=2.0.43
+  - jsonschema>=4.25.0
