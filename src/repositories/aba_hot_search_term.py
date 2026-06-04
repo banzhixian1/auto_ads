@@ -1,3 +1,4 @@
+import datetime
 from typing import Optional
 from src.utils.db_conn_pool import create_pg_pool, SQLAlchemyPool
 
@@ -38,59 +39,57 @@ class AbaHotSearchTermRepository:
     def get_top_asin_search_term(
         self,
         asin: str,
-        report_date: int | str,
+        year: int | None = None,
+        week_number: int | None = None,
+        report_date: int | str | None = None,
     ) -> list[dict]:
         """
-        查询指定 ASIN 在指定周下进入 ABA 前三商品的搜索词，按 ABA 排名升序返回。
-
+        查询指定asin在指定周下排名前三的关键词，仅返回 search_term，按 aba 排名升序
         Args:
-            asin: 需要查询的商品 ASIN。
-            report_date: 业务周标识，约定格式为 YYYYWW，例如 202526。
-
-        Returns:
-            list[dict]: 搜索词列表，每条记录至少包含：
-            - search_term: 搜索词
-            - search_rank: 搜索排名
-            - matched_position: 命中的商品位次（1/2/3）
-            - click_share: 该 ASIN 在该词下的点击份额
-            - conversion_share: 该 ASIN 在该词下的转化份额
-            - report_date: 周报日期
+            year: ISO 年
+            week: 本年第几周
         """
+        if report_date is not None:
+            normalized_week = self._normalize_report_week(report_date)
+            if len(normalized_week) != 6 or not normalized_week.isdigit():
+                raise ValueError(f"report_date 必须是 YYYYWW 格式，例如 202526，当前值: {report_date}")
+            year = int(normalized_week[:4])
+            week_number = int(normalized_week[4:])
+        elif year is None or week_number is None:
+            raise ValueError("year/week_number 和 report_date 至少需要提供一组。")
+
+        date_string = f"{year}-W{week_number:02d}-6"
+        target_date = datetime.datetime.strptime(date_string, "%G-W%V-%u").date()
+
         sql = """
-        SELECT
-            search_term,
-            search_rank,
-            CASE
-                WHEN top_product_1_asin = :asin THEN 1
-                WHEN top_product_2_asin = :asin THEN 2
-                WHEN top_product_3_asin = :asin THEN 3
-            END AS matched_position,
-            CASE
-                WHEN top_product_1_asin = :asin THEN top_product_1_click_share
-                WHEN top_product_2_asin = :asin THEN top_product_2_click_share
-                WHEN top_product_3_asin = :asin THEN top_product_3_click_share
-            END AS click_share,
-            CASE
-                WHEN top_product_1_asin = :asin THEN top_product_1_conversion_share
-                WHEN top_product_2_asin = :asin THEN top_product_2_conversion_share
-                WHEN top_product_3_asin = :asin THEN top_product_3_conversion_share
-            END AS conversion_share,
-            report_date
-        FROM aba_brand_search_words_weeks
-        WHERE to_char(report_date, 'IYYYIW') = :report_week
-          AND (
-              top_product_1_asin = :asin
-              OR top_product_2_asin = :asin
-              OR top_product_3_asin = :asin
-          )
-        ORDER BY search_rank ASC
+            SELECT 
+                search_term,
+                search_rank,
+                click_share,
+                conversion_share,
+                top_product_1_asin,
+                top_product_1_name,
+                top_product_1_click_share,
+                top_product_1_conversion_share,
+                top_product_2_asin,
+                top_product_2_name,
+                top_product_2_click_share,
+                top_product_2_conversion_share,
+                top_product_3_asin,
+                top_product_3_name,
+                top_product_3_click_share,
+                top_product_3_conversion_share
+            FROM 
+                aba_brand_search_words_weeks
+            WHERE 
+                report_date = :target_date
+                AND :asin IN (top_product_1_asin, top_product_2_asin, top_product_3_asin)
+            ORDER BY 
+                search_rank ASC
         """
-        params = {
-            "asin": asin,
-            "report_week": self._normalize_report_week(report_date),
-        }
-        return self.pool.query(sql, params, fetchall=True, return_dict=True)
-
+        params = {"asin": asin, "target_date": target_date}
+        rows = self.pool.query(sql, params=params)
+        return rows
 
     # -------------------------
     # 2. 单关键词历史查询
@@ -101,30 +100,34 @@ class AbaHotSearchTermRepository:
         weeks: int = 8
     ) -> list[dict]:
         """
-        获取单个搜索词的历史周数据（按周倒序）。
-
-        Args:
-            search_term: 搜索词文本。
-            weeks: 返回最近多少周的数据。
-
-        Returns:
-            list[dict]: 历史周数据列表，每条记录至少包含：
-            - report_date: 周报日期
-            - search_rank: 搜索排名
-            - click_share: 该词前三商品总点击份额
-            - conversion_share: 该词前三商品总转化份额
+        获取单个搜索词的历史周数据（按周倒序）
         """
         sql = """
-        SELECT
-            report_date,
-            search_rank,
-            click_share,
-            conversion_share
-        FROM aba_brand_search_words_weeks
-        WHERE search_term = :search_term
-        ORDER BY report_date DESC
-        LIMIT :weeks
+            SELECT
+                report_date,
+                search_rank,
+                click_share,
+                conversion_share,
+                top_product_1_asin,
+                top_product_1_name,
+                top_product_1_click_share,
+                top_product_1_conversion_share,
+                top_product_2_asin,
+                top_product_2_name,
+                top_product_2_click_share,
+                top_product_2_conversion_share,
+                top_product_3_asin,
+                top_product_3_name,
+                top_product_3_click_share,
+                top_product_3_conversion_share
+            FROM
+                aba_brand_search_words_weeks
+            WHERE
+                search_term = :search_term
+            ORDER BY
+                report_date DESC
+            LIMIT :weeks
         """
         params = {"search_term": search_term, "weeks": weeks}
-        return self.pool.query(sql, params, fetchall=True, return_dict=True)
+        return self.pool.query(sql, params=params)
     
