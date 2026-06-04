@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+from src.constants.expansion import ExpansionIntensity
+from src.utils.report_period import DateLike, ReportGranularity
 from src.schemas.keyword import KeywordCandidate
 from src.schemas.strategy import KeywordExpansionDecision
 
@@ -7,7 +9,8 @@ from src.schemas.strategy import KeywordExpansionDecision
 # 工作流输入
 @dataclass(slots=True)
 class SearchTermExpansionRequest:
-    report_date: int
+    report_date: DateLike
+    report_granularity: ReportGranularity | str = ReportGranularity.WEEK
     product_asin: str = ""
     start_date: str = ""
     end_date: str = ""
@@ -16,6 +19,7 @@ class SearchTermExpansionRequest:
     competitor_asins: list[str] = field(default_factory=list)
     product_title: str = ""
     product_features: list[str] = field(default_factory=list)
+    expansion_intensity: ExpansionIntensity | str = ExpansionIntensity.BALANCED
     average_order_price: float | None = None
     target_acos: float | None = None
     auto_execute: bool = False

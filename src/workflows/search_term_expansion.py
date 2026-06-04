@@ -1,3 +1,7 @@
+from src.constants.expansion import (
+    EXPANSION_INTENSITY_CONFIGS,
+    normalize_expansion_intensity,
+)
 from src.schemas.workflow import SearchTermExpansionRequest, SearchTermExpansionResult
 from src.services.aba_service import AbaService
 from src.services.ads_report_service import AdsReportService
@@ -16,6 +20,8 @@ def run_search_term_expansion(
     aba_service = aba_service or AbaService()
     ads_report_service = ads_report_service or AdsReportService()
     keyword_service = keyword_service or KeywordExpansionService()
+    intensity = normalize_expansion_intensity(request.expansion_intensity)
+    intensity_config = EXPANSION_INTENSITY_CONFIGS[intensity]
 
     # 第一步：优先查询用户搜索词流量来源
     # 用户搜索词分为关键词和商品两类，其中商品类可直接作为 ASIN 种子
@@ -28,10 +34,19 @@ def run_search_term_expansion(
 
     # 第二步：先从报表里挑“数据好的词”和“数据好的商品 ASIN”
     high_value_terms = keyword_service.collect_seed_terms(
-        manual_terms=[*request.seed_search_terms, *ads_report_service.select_high_value_terms(user_search_term_rows)],
+        manual_terms=[
+            *request.seed_search_terms,
+            *ads_report_service.select_high_value_terms_by_strategy(
+                user_search_term_rows,
+                include_attempt_terms=intensity_config.include_attempt_terms,
+            ),
+        ],
         asin_terms=[],
     )
-    high_value_asins = ads_report_service.select_high_value_product_asins(user_search_term_rows)
+    high_value_asins = ads_report_service.select_high_value_product_asins_by_strategy(
+        user_search_term_rows,
+        include_attempt_terms=intensity_config.include_attempt_terms,
+    )
 
     # 如果用户搜索词里没有商品流量，则回退到竞品 ASIN
     product_seed_asins = (
@@ -52,12 +67,14 @@ def run_search_term_expansion(
         terms=high_value_terms,
         aba_service=aba_service,
         report_date=request.report_date,
+        report_granularity=request.report_granularity,
     )
     # 2. ASIN -> 词
     asin_chain_candidates = keyword_service.expand_from_asins(
         asins=product_seed_asins,
         aba_service=aba_service,
         report_date=request.report_date,
+        report_granularity=request.report_granularity,
     )
 
     # 第五步：把双链路候选词和种子词自身合并
@@ -74,6 +91,10 @@ def run_search_term_expansion(
         candidates=candidates,
         product_title=request.product_title,
         product_features=request.product_features,
+    )
+    candidates = keyword_service.apply_rank_cutoff(
+        candidates=candidates,
+        max_search_rank=intensity_config.max_search_rank,
     )
 
     # 第七步：为每个候选词生成投放位置和 bid 建议

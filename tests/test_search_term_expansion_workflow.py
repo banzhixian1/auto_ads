@@ -1,21 +1,38 @@
 import unittest
 
+from src.constants.expansion import ExpansionIntensity
+from src.utils.report_period import ReportGranularity
 from src.schemas.workflow import SearchTermExpansionRequest
 from src.workflows.search_term_expansion import run_search_term_expansion
 
 
 class FakeAbaService:
-    def find_seed_terms_by_asin(self, asin: str, report_date: int) -> list[str]:
+    def find_seed_terms_by_asin(
+        self,
+        asin: str,
+        report_date,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
+    ) -> list[str]:
         return ["wireless mouse", "ergonomic mouse"]
 
-    def find_high_conversion_asins(self, search_term: str, report_date: int) -> list[str]:
+    def find_high_conversion_asins(
+        self,
+        search_term: str,
+        report_date,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
+    ) -> list[str]:
         mapping = {
             "wireless mouse": ["B00TERM1"],
             "office mouse": ["B00TERM2"],
         }
         return mapping.get(search_term, [])
 
-    def reverse_lookup_terms_by_asin(self, asin: str, report_date: int) -> list[str]:
+    def reverse_lookup_terms_by_asin(
+        self,
+        asin: str,
+        report_date,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
+    ) -> list[str]:
         mapping = {
             "B001FLOW": ["wireless mouse", "gaming mouse"],
             "B000TEST": ["wireless mouse", "ergonomic mouse"],
@@ -41,9 +58,23 @@ class FakeAbaService:
             search_term,
             (0.0, 0.0, 0.0),
         )
+        search_rank_map = {
+            "wireless mouse": 1_000,
+            "ergonomic mouse": 8_000,
+            "gaming mouse": 700_000,
+            "office mouse": 1_200_000,
+            "portable mouse": 40_000,
+            "bluetooth mouse": 100_000,
+            "silent mouse": 2_000_000,
+            "try mouse": 5_000,
+            "buy mouse": 5_000,
+            "rank ok": 1_000_000,
+            "rank too far": 2_000_000,
+        }
         return KeywordCandidate(
             term=search_term,
             source=source,
+            search_rank=search_rank_map.get(search_term),
             click_share=click_share,
             conversion_share=conversion_share,
             efficiency=efficiency,
@@ -73,11 +104,37 @@ class FakeAdsReportService:
     def select_high_value_product_asins(self, rows: list[dict]) -> list[str]:
         return [row["search_term"] for row in rows if row["term_type"] == "product" and row.get("orders", 0) > 0]
 
+    def select_high_value_terms_by_strategy(
+        self,
+        rows: list[dict],
+        include_attempt_terms: bool = True,
+    ) -> list[str]:
+        result = []
+        for row in rows:
+            if row["term_type"] != "keyword":
+                continue
+            if row.get("orders", 0) > 0 or (include_attempt_terms and row.get("clicks", 0) > 0):
+                result.append(row["search_term"])
+        return result
+
+    def select_high_value_product_asins_by_strategy(
+        self,
+        rows: list[dict],
+        include_attempt_terms: bool = True,
+    ) -> list[str]:
+        result = []
+        for row in rows:
+            if row["term_type"] != "product":
+                continue
+            if row.get("orders", 0) > 0 or (include_attempt_terms and row.get("clicks", 0) > 0):
+                result.append(row["search_term"])
+        return result
+
 
 class SearchTermExpansionWorkflowTestCase(unittest.TestCase):
     def test_run_search_term_expansion(self):
         request = SearchTermExpansionRequest(
-            report_date=202526,
+            report_date="2026-06-04",
             product_asin="B00SELF",
             start_date="2026-05-01",
             end_date="2026-05-31",
@@ -95,7 +152,7 @@ class SearchTermExpansionWorkflowTestCase(unittest.TestCase):
             ads_report_service=FakeAdsReportService(
                 rows=[
                     {"term_type": "keyword", "search_term": "wireless mouse", "orders": 3, "clicks": 10},
-                    {"term_type": "product", "search_term": "B001FLOW", "orders": 2, "clicks": 8},
+                    {"term_type": "product", "search_term": "B001FLOW", "orders": 2, "clicks": 8, "search_rank": 1000},
                 ]
             ),
         )
@@ -106,14 +163,15 @@ class SearchTermExpansionWorkflowTestCase(unittest.TestCase):
         self.assertEqual(result.high_value_asins, ["B001FLOW"])
         candidate_terms = [candidate.term for candidate in result.candidates]
         self.assertIn("portable mouse", candidate_terms)
-        self.assertIn("gaming mouse", candidate_terms)
         self.assertIn("wireless mouse", candidate_terms)
+        self.assertNotIn("gaming mouse", candidate_terms)
+        self.assertNotIn("silent mouse", candidate_terms)
         self.assertEqual(len(result.decisions), len(result.candidates))
         self.assertEqual(result.skipped_terms, [])
 
     def test_fallback_to_competitor_asins_when_report_has_no_product_terms(self):
         request = SearchTermExpansionRequest(
-            report_date=202526,
+            report_date="2026-06-04",
             product_asin="B00SELF",
             start_date="2026-05-01",
             end_date="2026-05-31",
@@ -135,6 +193,58 @@ class SearchTermExpansionWorkflowTestCase(unittest.TestCase):
         self.assertEqual(result.product_seed_asins, ["B000TEST", "B000TEST2"])
         self.assertIn("wireless mouse", result.seeds)
         self.assertIn("bluetooth mouse", [candidate.term for candidate in result.candidates])
+
+    def test_conservative_intensity_excludes_attempt_terms(self):
+        request = SearchTermExpansionRequest(
+            report_date="2026-06-04",
+            product_asin="B00SELF",
+            start_date="2026-05-01",
+            end_date="2026-05-31",
+            product_title="Wireless ergonomic mouse",
+            product_features=["silent click", "usb receiver"],
+            expansion_intensity=ExpansionIntensity.CONSERVATIVE,
+        )
+
+        result = run_search_term_expansion(
+            request=request,
+            aba_service=FakeAbaService(),
+            ads_report_service=FakeAdsReportService(
+                rows=[
+                    {"term_type": "keyword", "search_term": "try mouse", "orders": 0, "clicks": 4, "search_rank": 5000},
+                    {"term_type": "keyword", "search_term": "buy mouse", "orders": 1, "clicks": 4, "search_rank": 5000},
+                    {"term_type": "product", "search_term": "B001TRY", "orders": 0, "clicks": 3, "search_rank": 5000},
+                ]
+            ),
+        )
+
+        self.assertEqual(result.high_value_terms, ["buy mouse"])
+        self.assertEqual(result.product_seed_asins, [])
+
+    def test_aggressive_intensity_respects_rank_cap(self):
+        request = SearchTermExpansionRequest(
+            report_date="2026-06-04",
+            product_asin="B00SELF",
+            start_date="2026-05-01",
+            end_date="2026-05-31",
+            expansion_intensity=ExpansionIntensity.AGGRESSIVE,
+            competitor_asins=["B000TEST"],
+        )
+
+        result = run_search_term_expansion(
+            request=request,
+            aba_service=FakeAbaService(),
+            ads_report_service=FakeAdsReportService(
+                rows=[
+                    {"term_type": "keyword", "search_term": "rank ok", "orders": 0, "clicks": 2, "search_rank": 1_000_000},
+                    {"term_type": "keyword", "search_term": "rank too far", "orders": 3, "clicks": 5, "search_rank": 2_000_000},
+                ]
+            ),
+        )
+
+        self.assertIn("rank ok", result.high_value_terms)
+        self.assertIn("rank too far", result.high_value_terms)
+        self.assertIn("rank ok", [candidate.term for candidate in result.candidates])
+        self.assertNotIn("rank too far", [candidate.term for candidate in result.candidates])
 
 
 if __name__ == "__main__":

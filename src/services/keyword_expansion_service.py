@@ -1,5 +1,6 @@
 from src.schemas.keyword import KeywordCandidate
 from .aba_service import AbaService
+from src.utils.report_period import DateLike, ReportGranularity
 
 
 class KeywordExpansionService:
@@ -26,7 +27,8 @@ class KeywordExpansionService:
         self,
         terms: list[str],
         aba_service: AbaService,
-        report_date: int,
+        report_date: DateLike,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
     ) -> list[KeywordCandidate]:
         # 词 -> ASIN -> 词
         # 先保留高价值词自身，再继续找高转化 ASIN，最后从 ASIN 反查词
@@ -36,9 +38,14 @@ class KeywordExpansionService:
             high_value_asins = aba_service.find_high_conversion_asins(
                 search_term=term,
                 report_date=report_date,
+                report_granularity=report_granularity,
             )
             for asin in high_value_asins:
-                for expanded_term in aba_service.reverse_lookup_terms_by_asin(asin, report_date):
+                for expanded_term in aba_service.reverse_lookup_terms_by_asin(
+                    asin,
+                    report_date,
+                    report_granularity=report_granularity,
+                ):
                     candidate = aba_service.build_keyword_candidate(
                         expanded_term,
                         source=f"term_asin_term:{term}->{asin}",
@@ -52,12 +59,17 @@ class KeywordExpansionService:
         self,
         asins: list[str],
         aba_service: AbaService,
-        report_date: int,
+        report_date: DateLike,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
     ) -> list[KeywordCandidate]:
         # ASIN -> 词
         candidates: list[KeywordCandidate] = []
         for asin in asins:
-            for term in aba_service.reverse_lookup_terms_by_asin(asin, report_date):
+            for term in aba_service.reverse_lookup_terms_by_asin(
+                asin,
+                report_date,
+                report_granularity=report_granularity,
+            ):
                 candidate = aba_service.build_keyword_candidate(term, source=f"asin_term:{asin}")
                 if asin not in candidate.related_asins:
                     candidate.related_asins.append(asin)
@@ -92,6 +104,11 @@ class KeywordExpansionService:
             target.click_share = max(target.click_share, candidate.click_share)
             target.conversion_share = max(target.conversion_share, candidate.conversion_share)
             target.efficiency = max(target.efficiency, candidate.efficiency)
+            if candidate.search_rank is not None:
+                if target.search_rank is None:
+                    target.search_rank = candidate.search_rank
+                else:
+                    target.search_rank = min(target.search_rank, candidate.search_rank)
         return list(merged.values())
 
     def filter_relevant_candidates(
@@ -111,6 +128,20 @@ class KeywordExpansionService:
             else:
                 skipped.append(candidate.term)
         return approved, skipped
+
+    def apply_rank_cutoff(
+        self,
+        candidates: list[KeywordCandidate],
+        max_search_rank: int | None,
+    ) -> list[KeywordCandidate]:
+        # 在候选词汇总、去重、相关性过滤后，再按排名上限截断。
+        if max_search_rank is None:
+            return candidates
+        filtered: list[KeywordCandidate] = []
+        for candidate in candidates:
+            if candidate.search_rank is None or candidate.search_rank <= max_search_rank:
+                filtered.append(candidate)
+        return filtered
 
     def is_candidate_relevant(self, term: str, context_text: str) -> bool:
         # 极简相关性判断：

@@ -20,6 +20,7 @@ class AsinSeed:
 class KeywordCandidate:
     term: str
     source: str
+    search_rank: int | None = None
     click_share: float = 0.0
     conversion_share: float = 0.0
     efficiency: float = 0.0

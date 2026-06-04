@@ -1,8 +1,8 @@
-from src.repositories.ads_report import DateLike
+from src.repositories.ads_report import DateLike, AdsReportRepository
 
 
 class AdsReportService:
-    def __init__(self, repo=None):
+    def __init__(self, repo: AdsReportRepository = None):
         # repo 允许注入真实报表仓库或测试桩
         self.repo = repo
 
@@ -47,6 +47,14 @@ class AdsReportService:
 
     def select_high_value_terms(self, rows: list[dict]) -> list[str]:
         # 从报表关键词流量里先筛出“值得继续扩展”的词
+        return self.select_high_value_terms_by_strategy(rows)
+
+    def select_high_value_terms_by_strategy(
+        self,
+        rows: list[dict],
+        include_attempt_terms: bool = True,
+    ) -> list[str]:
+        # 根据拓词强度筛选高价值词。
         selected_terms: list[str] = []
         for row in rows:
             term_type = str(row.get("term_type", "")).strip().lower()
@@ -55,12 +63,20 @@ class AdsReportService:
             term_value = str(row.get("search_term", "")).strip()
             if not term_value:
                 continue
-            if self.is_high_value_row(row):
+            if self.is_high_value_row(row, include_attempt_terms=include_attempt_terms):
                 selected_terms.append(term_value)
         return self.deduplicate_values(selected_terms)
 
     def select_high_value_product_asins(self, rows: list[dict]) -> list[str]:
         # 从报表商品流量里先筛出“值得继续扩展”的商品入口
+        return self.select_high_value_product_asins_by_strategy(rows)
+
+    def select_high_value_product_asins_by_strategy(
+        self,
+        rows: list[dict],
+        include_attempt_terms: bool = True,
+    ) -> list[str]:
+        # 根据拓词强度筛选高价值商品入口。
         selected_asins: list[str] = []
         for row in rows:
             term_type = str(row.get("term_type", "")).strip().lower()
@@ -69,18 +85,22 @@ class AdsReportService:
             term_value = str(row.get("search_term", "")).strip()
             if not term_value:
                 continue
-            if self.is_high_value_row(row):
+            if self.is_high_value_row(row, include_attempt_terms=include_attempt_terms):
                 selected_asins.append(term_value)
         return self.deduplicate_values(selected_asins)
 
-    def is_high_value_row(self, row: dict) -> bool:
+    def is_high_value_row(self, row: dict, include_attempt_terms: bool = True) -> bool:
         # 报表字段暂按最小假设处理：
-        # 1. 有订单优先视为高价值
-        # 2. 没订单但有点击，先保守放行
-        # 3. 两者都没有则不进入后续扩展
+        # 1. 优先策略：有订单视为高价值
+        # 2. 尝试策略：没订单但有点击时，是否纳入由强度控制
         orders = self.to_float(row.get("orders"))
         clicks = self.to_float(row.get("clicks"))
-        return orders > 0 or clicks > 0
+        if orders > 0:
+            return True
+        if include_attempt_terms and clicks > 0:
+            return True
+        return False
+
 
     def deduplicate_values(self, values: list[str]) -> list[str]:
         # 去重并保留原始顺序
