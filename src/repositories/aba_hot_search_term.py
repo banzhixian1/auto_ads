@@ -1,9 +1,13 @@
-import datetime
 from typing import Optional
+from src.utils.report_period import (
+    DateLike,
+    ReportGranularity,
+    resolve_latest_published_report_anchor_date,
+)
 from src.utils.db_conn_pool import create_pg_pool, SQLAlchemyPool
 
 # 可选全局默认 pool
-DEFAULT_POOL = create_pg_pool('am_aba_search_term')
+DEFAULT_POOL = create_pg_pool(database='am_aba_search_term', conn_name='default')
 
 
 class AbaHotSearchTermRepository:
@@ -21,45 +25,27 @@ class AbaHotSearchTermRepository:
         """
         self.pool = pool or DEFAULT_POOL
 
-    def _normalize_report_week(self, report_date: int | str) -> str:
-        """
-        将业务侧传入的周标识统一转为 ISO 周字符串。
-
-        Args:
-            report_date: 业务周标识，约定格式为 YYYYWW，例如 202526。
-
-        Returns:
-            str: ISO 周字符串，格式为 YYYYWW。
-        """
-        return str(report_date).strip()
-
     # -------------------------
     # 1. 查询指定asin在指定周下有排名前三的关键词
     # -------------------------
     def get_top_asin_search_term(
         self,
         asin: str,
-        year: int | None = None,
-        week_number: int | None = None,
-        report_date: int | str | None = None,
+        report_date: DateLike,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
     ) -> list[dict]:
         """
-        查询指定asin在指定周下排名前三的关键词，仅返回 search_term，按 aba 排名升序
-        Args:
-            year: ISO 年
-            week: 本年第几周
-        """
-        if report_date is not None:
-            normalized_week = self._normalize_report_week(report_date)
-            if len(normalized_week) != 6 or not normalized_week.isdigit():
-                raise ValueError(f"report_date 必须是 YYYYWW 格式，例如 202526，当前值: {report_date}")
-            year = int(normalized_week[:4])
-            week_number = int(normalized_week[4:])
-        elif year is None or week_number is None:
-            raise ValueError("year/week_number 和 report_date 至少需要提供一组。")
+        查询指定 ASIN 在目标报告周期下排名前三的关键词，按 ABA 排名升序返回。
 
-        date_string = f"{year}-W{week_number:02d}-6"
-        target_date = datetime.datetime.strptime(date_string, "%G-W%V-%u").date()
+        Args:
+            asin: 需要查询的商品 ASIN。
+            report_date: 自然日期，支持 str / date / datetime。
+            report_granularity: 报告粒度，当前仓库仅支持 week。
+        """
+        target_date = resolve_latest_published_report_anchor_date(
+            report_date=report_date,
+            report_granularity=report_granularity,
+        )
 
         sql = """
             SELECT 
@@ -97,7 +83,7 @@ class AbaHotSearchTermRepository:
     def get_search_term_history(
         self,
         search_term: str,
-        weeks: int = 8
+        weeks: int = 8,
     ) -> list[dict]:
         """
         获取单个搜索词的历史周数据（按周倒序）

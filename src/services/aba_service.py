@@ -1,18 +1,33 @@
-from src.constants.metrics import DEFAULT_DECAY, DEFAULT_WEEKS
+from src.constants.metrics import (
+    DEFAULT_DECAY,
+    DEFAULT_EFFICIENCY_THRESHOLD,
+    DEFAULT_WEEKS,
+)
+from src.utils.report_period import DateLike, ReportGranularity
 from src.data_processor.aba_hot_search_term import weighted_aba_metrics
 from src.schemas.keyword import KeywordCandidate
+from src.repositories.aba_hot_search_term import AbaHotSearchTermRepository
 
 
 class AbaService:
-    def __init__(self, repo=None):
+    def __init__(self, repo: AbaHotSearchTermRepository = None):
         # repo 允许注入，方便后续接真实数据库或测试桩
         self.repo = repo
 
-    def find_seed_terms_by_asin(self, asin: str, report_date: int) -> list[str]:
+    def find_seed_terms_by_asin(
+        self,
+        asin: str,
+        report_date: DateLike,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
+    ) -> list[str]:
         # 从 ABA 数据里反查某个 ASIN 上榜过的搜索词
         if self.repo is None:
             return []
-        rows = self.repo.get_top_asin_search_term(asin=asin, report_date=report_date)
+        rows = self.repo.get_top_asin_search_term(
+            asin=asin,
+            report_date=report_date,
+            report_granularity=report_granularity,
+        )
         return [row["search_term"] for row in rows if row.get("search_term")]
 
     def get_search_term_history(self, search_term: str, weeks: int = DEFAULT_WEEKS) -> list[dict]:
@@ -25,9 +40,11 @@ class AbaService:
         # 把原始历史数据组装成候选词对象
         history = self.get_search_term_history(search_term)
         metrics = self.calculate_weighted_metrics(history)
+        search_rank = self._get_best_search_rank(history)
         return KeywordCandidate(
             term=search_term,
             source=source,
+            search_rank=search_rank,
             click_share=metrics["weighted_click_share"],
             conversion_share=metrics["weighted_conv_share"],
             efficiency=metrics["efficiency"],
@@ -50,12 +67,87 @@ class AbaService:
         conv_list = [float(item.get("conversion_share", 0.0)) for item in history]
         return weighted_aba_metrics(click_list=click_list, conv_list=conv_list, decay=decay)
 
-    def find_high_conversion_asins(self, search_term: str, report_date: int) -> list[str]:
-        # 这里后续要接“词找 ASIN”能力：
-        # 给定一个高价值词，继续找该词下转化效率高的 ASIN
-        # 当前仓库层尚未补 SQL，因此默认返回空列表
-        return []
+    def _get_best_search_rank(self, history: list[dict]) -> int | None:
+        # 取历史窗口内最靠前的搜索排名，后续用于候选词截断。
+        ranks: list[int] = []
+        for item in history:
+            rank = item.get("search_rank")
+            if rank in (None, ""):
+                continue
+            try:
+                ranks.append(int(rank))
+            except (TypeError, ValueError):
+                continue
+        if not ranks:
+            return None
+        return min(ranks)
 
-    def reverse_lookup_terms_by_asin(self, asin: str, report_date: int) -> list[str]:
+    def find_high_conversion_asins(
+        self,
+        search_term: str,
+        report_date: DateLike | None = None,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
+    ) -> list[str]:
+        # 给定一个高价值词，找其历史周数据中出现在前三的商品，
+        # 再按商品维度做时间加权，筛出数据好的商品。
+        # report_date / report_granularity 当前未参与历史窗口截断，
+        # 保留该参数是为了兼容现有 workflow 调用签名，
+        # 后续如果要按某个周期截断历史窗口，可以在这里接入。
+        history = self.get_search_term_history(search_term)
+        if not history:
+            return []
+
+        asin_histories = self._build_asin_histories(history)
+        asin_scores: list[tuple[str, dict]] = []
+        for asin, metrics_history in asin_histories.items():
+            if len(metrics_history) < 2:
+                continue
+            weighted_metrics = self.calculate_weighted_metrics(metrics_history)
+            if self._is_high_value_asin(weighted_metrics):
+                asin_scores.append((asin, weighted_metrics))
+
+        asin_scores.sort(
+            key=lambda item: (
+                item[1]["efficiency"],
+                item[1]["weighted_conv_share"],
+                item[1]["weighted_click_share"],
+            ),
+            reverse=True,
+        )
+        return [asin for asin, _ in asin_scores]
+
+    def _build_asin_histories(self, history: list[dict]) -> dict[str, list[dict]]:
+        # 把每周前三商品展开成 ASIN 维度的历史份额轨迹。
+        asin_histories: dict[str, list[dict]] = {}
+        for row in history:
+            for index in range(1, 4):
+                asin = row.get(f"top_product_{index}_asin")
+                if not asin:
+                    continue
+                asin_histories.setdefault(asin, []).append(
+                    {
+                        "click_share": float(row.get(f"top_product_{index}_click_share", 0.0) or 0.0),
+                        "conversion_share": float(
+                            row.get(f"top_product_{index}_conversion_share", 0.0) or 0.0
+                        ),
+                    }
+                )
+        return asin_histories
+
+    def _is_high_value_asin(self, weighted_metrics: dict) -> bool:
+        # 数据好的商品定义：加权出单效率达到阈值。
+        efficiency = float(weighted_metrics.get("efficiency", 0.0))
+        return efficiency >= DEFAULT_EFFICIENCY_THRESHOLD
+
+    def reverse_lookup_terms_by_asin(
+        self,
+        asin: str,
+        report_date: DateLike,
+        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
+    ) -> list[str]:
         # 当前阶段直接复用 ABA 反查，后续可替换为更完整的 ASIN 找词逻辑
-        return self.find_seed_terms_by_asin(asin=asin, report_date=report_date)
+        return self.find_seed_terms_by_asin(
+            asin=asin,
+            report_date=report_date,
+            report_granularity=report_granularity,
+        )
