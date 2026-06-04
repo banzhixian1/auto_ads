@@ -1,32 +1,42 @@
 from src.utils.requests_client import requests_client
 from src.utils.configer import *
 config_name = 'apis'
+
 default_value = {
-    'base_url': 'http://192.168.6.198:10001',
+    'api_key': '',
+    'base_url': 'http://192.168.6.198:10010',
+    'default_model': 'Qwen3-VL-8B-Instruct',
 }
-init_config_section(config_name, 'local_llm', default_value)
+required_fields = ['api_key']
+init_config_section(config_name, 'model_scheduler', default_value, required_fields)
 config = read_config(config_name)
 
-def inference(messages: list[dict], model_name='Qwen3-VL-8B-Instruct') -> str:
-    if model_name == 'Qwen3-VL-8B-Instruct':
-        return local_inference(messages, model_name)
-    else:
-        raise ValueError(f"model_name {model_name} not supported")
+api_key = config.get('model_scheduler', 'api_key')
+base_url = config.get('model_scheduler', 'base_url')
+default_model = config.get('model_scheduler', 'default_model')
 
-local_llm_url = config.get('local_llm', 'base_url')
-def local_inference(messages: list[dict], model_name='Qwen3-VL-8B-Instruct') -> str:
-    url = local_llm_url + "/predict"
+inference_url = base_url + '/inference'
+def inference(messages: list[dict], model_name=None, timeout=None, orgin_result=False) -> str:
+    if model_name is None:
+        model_name = default_model
+    url = inference_url
+
     body = {
-        'model_name': model_name,
+        "model_name": model_name,
+        "api_key": api_key,
+        "timeout": timeout,
         "input": {
             "messages": messages
         }
-    }
-    try:
-        response = requests_client.post(url, json=body, timeout=300)
-        return response.json()['result']
-    except Exception as e:
-        e.args = (
-            f"local_inference failed, error={e}, body={body}",
-        )
-        raise
+    } 
+    response = requests_client.post(url, json=body, timeout=timeout)
+    result = response.json()
+    if orgin_result:
+        return result
+    if 'candidates' in result:
+        text = result['candidates'][0]['content']['parts'][0]['text']
+    elif 'choices' in result:
+        text = result['choices'][0]['message']['content']
+    elif 'result' in result:
+        text = result['result']
+    return text
