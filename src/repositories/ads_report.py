@@ -89,6 +89,41 @@ class AdsReportRepository:
             return f"STR_TO_DATE(DATE_FORMAT({column_name}, '%Y-%m-01'), '%Y-%m-%d')"
         raise ValueError(f"不支持的时间粒度: {time_granularity!r}")
 
+    def get_enabled_asin_campaign_scope_cte(self) -> str:
+        """
+        返回通用 CTE：通过 ASIN 找到关联且状态为 ENABLED 的广告活动。
+
+        依赖参数：
+        - asin: 已标准化为大写的 ASIN。
+        """
+        return """
+            enabled_asin_campaign_scope AS (
+                SELECT DISTINCT
+                    ap.profile_id,
+                    ap.campaign_id,
+                    campaign.campaign_name,
+                    campaign.ad_type,
+                    campaign.state,
+                    campaign.budget,
+                    campaign.delivery_status
+                FROM
+                    amz_ad_ad_product ap
+                    INNER JOIN amz_ad_campaign campaign
+                        ON ap.profile_id = campaign.profile_id
+                        AND ap.campaign_id = campaign.campaign_id
+                WHERE
+                    ap.campaign_id IS NOT NULL
+                    AND UPPER(campaign.state) = 'ENABLED'
+                    AND (
+                        (
+                            UPPER(ap.product_id_type) = 'ASIN'
+                            AND UPPER(ap.product_id) = :asin
+                        )
+                        OR UPPER(ap.resolved_product_id) = :asin
+                    )
+            )
+        """
+
 
     # 用户搜索词 
     def get_user_search_terms_by_asin(
@@ -107,13 +142,22 @@ class AdsReportRepository:
 
         Returns:
             list[dict]: 用户搜索词明细列表。
-            每条记录建议至少包含以下字段：
-            - term_type: 流量类型，取值建议为 keyword 或 product
-            - search_term: 搜索词文本，或商品流量对应的 ASIN
+            每条记录包含以下展示字段：
+            - search_term: 用户搜索词
+            - campaign_ad_group: 所属广告活动/组
+            - impressions: 曝光量
             - clicks: 点击量
-            - orders: 订单量
-            - spend: 花费
-            - sales: 销售额
+            - ctr: CTR
+            - spend: 广告花费
+            - cpc: CPC
+            - sales: 广告总销售额
+            - acos: ACoS
+            - roas: ROAS
+            - orders: 广告总订单量
+            - cvr: CVR
+            - cpa: CPA
+            - units_sold: 广告总销量
+            - term_type: 兼容字段，keyword 或 product
 
         Notes:
             该方法对应 workflow 的“查询用户搜索词”步骤，
@@ -126,76 +170,203 @@ class AdsReportRepository:
         if not normalized_asin:
             return []
 
-        sql = """
-            WITH target_asin_scope AS (
-                SELECT
-                    profile_id,
-                    campaign_id,
-                    ad_group_id
-                FROM
-                    amz_ad_rpt_ad
-                WHERE
-                    report_date BETWEEN :start_date AND :end_date
-                    AND UPPER(asin) = :asin
-                GROUP BY
-                    profile_id,
-                    campaign_id,
-                    ad_group_id
-            ),
-            strict_asin_scope AS (
-                SELECT
-                    target_asin_scope.profile_id,
-                    target_asin_scope.campaign_id,
-                    target_asin_scope.ad_group_id
-                FROM
-                    target_asin_scope
-                WHERE
-                    NOT EXISTS (
-                        SELECT
-                            1
-                        FROM
-                            amz_ad_rpt_ad other_ad
-                        WHERE
-                            other_ad.report_date BETWEEN :start_date AND :end_date
-                            AND other_ad.profile_id = target_asin_scope.profile_id
-                            AND other_ad.campaign_id = target_asin_scope.campaign_id
-                            AND other_ad.ad_group_id = target_asin_scope.ad_group_id
-                            AND other_ad.asin IS NOT NULL
-                            AND other_ad.asin <> ''
-                            AND UPPER(other_ad.asin) <> :asin
-                    )
-            )
+        sql = f"""
+            WITH {self.get_enabled_asin_campaign_scope_cte()}
             SELECT
-                CASE
-                    WHEN UPPER(COALESCE(st.query, '')) REGEXP '^[A-Z0-9]{10}$' THEN 'product'
-                    ELSE 'keyword'
-                END AS term_type,
                 st.query AS search_term,
+                CASE
+                    WHEN NULLIF(MAX(st.campaign_name), '') IS NULL THEN NULLIF(MAX(st.ad_group_name), '')
+                    WHEN NULLIF(MAX(st.ad_group_name), '') IS NULL THEN NULLIF(MAX(st.campaign_name), '')
+                    WHEN MAX(st.campaign_name) = MAX(st.ad_group_name) THEN MAX(st.campaign_name)
+                    ELSE CONCAT(MAX(st.campaign_name), ' / ', MAX(st.ad_group_name))
+                END AS campaign_ad_group,
+                SUM(st.impressions) AS impressions,
                 SUM(st.clicks) AS clicks,
-                SUM(st.attributed_conversions_7d) AS orders,
+                ROUND(SUM(st.clicks) / NULLIF(SUM(st.impressions), 0), 6) AS ctr,
                 ROUND(SUM(st.cost), 4) AS spend,
-                ROUND(SUM(st.attributed_sales_7d), 4) AS sales
+                ROUND(SUM(st.cost) / NULLIF(SUM(st.clicks), 0), 4) AS cpc,
+                ROUND(SUM(st.attributed_sales_7d), 4) AS sales,
+                ROUND(SUM(st.cost) / NULLIF(SUM(st.attributed_sales_7d), 0), 4) AS acos,
+                ROUND(SUM(st.attributed_sales_7d) / NULLIF(SUM(st.cost), 0), 4) AS roas,
+                SUM(st.attributed_conversions_7d) AS orders,
+                ROUND(SUM(st.attributed_conversions_7d) / NULLIF(SUM(st.clicks), 0), 6) AS cvr,
+                ROUND(SUM(st.cost) / NULLIF(SUM(st.attributed_conversions_7d), 0), 4) AS cpa,
+                SUM(st.attributed_units_ordered_7d) AS units_sold,
+                CASE
+                    WHEN UPPER(COALESCE(st.query, '')) REGEXP '^[A-Z0-9]{{10}}$' THEN 'product'
+                    ELSE 'keyword'
+                END AS term_type
             FROM
                 amz_ad_rpt_search_term st
-                INNER JOIN strict_asin_scope s
+                INNER JOIN enabled_asin_campaign_scope s
                     ON st.profile_id = s.profile_id
                     AND st.campaign_id = s.campaign_id
-                    AND st.ad_group_id = s.ad_group_id
             WHERE
                 st.report_date BETWEEN :start_date AND :end_date
                 AND st.query IS NOT NULL
                 AND st.query <> ''
             GROUP BY
+                st.profile_id,
+                st.campaign_id,
+                st.ad_group_id,
+                st.query,
                 CASE
-                    WHEN UPPER(COALESCE(st.query, '')) REGEXP '^[A-Z0-9]{10}$' THEN 'product'
+                    WHEN UPPER(COALESCE(st.query, '')) REGEXP '^[A-Z0-9]{{10}}$' THEN 'product'
                     ELSE 'keyword'
-                END,
-                st.query
+                END
             ORDER BY
                 clicks DESC,
+                campaign_ad_group ASC,
                 search_term ASC
         """
         params = {
+            "asin": normalized_asin,
+            "start_date": normalized_start_date,
+            "end_date": normalized_end_date,
+        }
+        return self.pool.query(sql, params=params)
+    
+
+    # 用户搜索词趋势
+    def get_target_data(
+        self,
+        target_type: str,
+        target_value: str,
+        start_date: DateLike,
+        end_date: DateLike,
+        time_granularity: TimeGranularity | str,
+        asin: str | None = None,
+    ) -> list[dict]:
+        """
+        查询指定用户搜索词在指定时间范围内的历史趋势数据。
+
+        Args:
+            target_type: 搜索词类型，取值建议为 keyword 或 product。
+            target_value: 搜索词值。target_type 为 keyword 时传用户搜索词，
+                target_type 为 product 时传商品 ASIN。
+            start_date: 开始日期，支持 str / date / datetime。
+            end_date: 结束日期，支持 str / date / datetime。
+            time_granularity: 时间粒度，支持 TimeGranularity 枚举或对应字符串。
+            asin: 当前商品 ASIN，用于限定 G+ 口径下的商品广告结构。
+
+        Returns:
+            list[dict]: 用户搜索词趋势数据列表。
+            每条记录建议至少包含以下字段：
+            - report_date: 报表周期
+            - search_term: 用户搜索词
+            - campaign_ad_group: 所属广告活动/组
+            - impressions: 曝光量
+            - clicks: 点击量
+            - ctr: CTR
+            - spend: 广告花费
+            - cpc: CPC
+            - sales: 销售额
+            - acos: ACOS
+            - roas: ROAS
+            - orders: 广告总订单量
+            - cvr: CVR
+            - cpa: CPA
+            - units_sold: 广告总销量
+            - term_type: keyword 或 product
+
+        Notes:
+            该方法对应前端“用户搜索词趋势分析”弹窗，
+            直接基于搜索词报表中的 query 字段按时间粒度聚合。
+        """
+        normalized_target_type = str(target_type).strip().lower()
+        normalized_target_value = str(target_value).strip()
+        normalized_asin = str(asin).strip().upper() if asin else ""
+        normalized_start_date = self.normalize_date_input(start_date)
+        normalized_end_date = self.normalize_date_input(end_date)
+        period_expression = self.get_report_period_expression(
+            "st.report_date",
+            time_granularity,
+        )
+
+        if not normalized_target_type or not normalized_target_value or not normalized_asin:
+            return []
+
+        if normalized_target_type == "keyword":
+            target_filter = "st.query = :target_value"
+            normalized_target_value_param = normalized_target_value
+        elif normalized_target_type == "product":
+            target_filter = "UPPER(st.query) = :target_value"
+            normalized_target_value_param = normalized_target_value.upper()
+        else:
+            raise ValueError(f"不支持的投放目标类型: {target_type!r}")
+
+        sql = f"""
+            WITH {self.get_enabled_asin_campaign_scope_cte()},
+            target_search_term_scope AS (
+                SELECT
+                    st.profile_id,
+                    st.campaign_id,
+                    st.ad_group_id,
+                    CASE
+                        WHEN NULLIF(MAX(st.campaign_name), '') IS NULL THEN NULLIF(MAX(st.ad_group_name), '')
+                        WHEN NULLIF(MAX(st.ad_group_name), '') IS NULL THEN NULLIF(MAX(st.campaign_name), '')
+                        WHEN MAX(st.campaign_name) = MAX(st.ad_group_name) THEN MAX(st.campaign_name)
+                        ELSE CONCAT(MAX(st.campaign_name), ' / ', MAX(st.ad_group_name))
+                    END AS campaign_ad_group,
+                    COALESCE(SUM(st.clicks), 0) AS total_clicks,
+                    COALESCE(SUM(st.impressions), 0) AS total_impressions
+                FROM
+                    amz_ad_rpt_search_term st
+                    INNER JOIN enabled_asin_campaign_scope asin_scope
+                        ON st.profile_id = asin_scope.profile_id
+                        AND st.campaign_id = asin_scope.campaign_id
+                WHERE
+                    st.report_date BETWEEN :start_date AND :end_date
+                    AND {target_filter}
+                GROUP BY
+                    st.profile_id,
+                    st.campaign_id,
+                    st.ad_group_id
+                ORDER BY
+                    total_clicks DESC,
+                    campaign_ad_group ASC,
+                    total_impressions DESC,
+                    st.campaign_id ASC,
+                    st.ad_group_id ASC
+                LIMIT 1
+            )
+            SELECT
+                {period_expression} AS report_date,
+                :target_value AS search_term,
+                MAX(target_scope.campaign_ad_group) AS campaign_ad_group,
+                SUM(st.impressions) AS impressions,
+                SUM(st.clicks) AS clicks,
+                ROUND(SUM(st.clicks) / NULLIF(SUM(st.impressions), 0), 6) AS ctr,
+                ROUND(SUM(st.cost), 4) AS spend,
+                ROUND(SUM(st.cost) / NULLIF(SUM(st.clicks), 0), 4) AS cpc,
+                ROUND(SUM(st.attributed_sales_7d), 4) AS sales,
+                ROUND(SUM(st.cost) / NULLIF(SUM(st.attributed_sales_7d), 0), 4) AS acos,
+                ROUND(SUM(st.attributed_sales_7d) / NULLIF(SUM(st.cost), 0), 4) AS roas,
+                SUM(st.attributed_conversions_7d) AS orders,
+                ROUND(SUM(st.attributed_conversions_7d) / NULLIF(SUM(st.clicks), 0), 6) AS cvr,
+                ROUND(SUM(st.cost) / NULLIF(SUM(st.attributed_conversions_7d), 0), 4) AS cpa,
+                SUM(st.attributed_units_ordered_7d) AS units_sold,
+                CASE
+                    WHEN :target_type = 'product' THEN 'product'
+                    ELSE 'keyword'
+                END AS term_type
+            FROM
+                amz_ad_rpt_search_term st
+                INNER JOIN target_search_term_scope target_scope
+                    ON st.profile_id = target_scope.profile_id
+                    AND st.campaign_id = target_scope.campaign_id
+                    AND st.ad_group_id <=> target_scope.ad_group_id
+            WHERE
+                st.report_date BETWEEN :start_date AND :end_date
+                AND {target_filter}
+            GROUP BY
+                {period_expression}
+            ORDER BY
+                report_date DESC
+        """
+        params = {
+            "target_type": normalized_target_type,
+            "target_value": normalized_target_value_param,
             "asin": normalized_asin,
             "start_date": normalized_start_date,
             "end_date": normalized_end_date,
@@ -219,16 +390,25 @@ class AdsReportRepository:
 
         Returns:
             list[dict]: 广告活动维度的汇总数据列表。
-            每条记录建议至少包含以下字段：
+            每条记录包含以下字段：
+            - enabled: 是否有效，当前仅返回 ENABLED 活动
             - campaign_id: 广告活动 ID
             - campaign_name: 广告活动名称
+            - ad_type: 广告类型
+            - budget: 预算
             - impressions: 曝光量
             - clicks: 点击量
-            - orders: 订单量
-            - spend: 花费
-            - sales: 销售额
-            - acos: ACOS
+            - ctr: CTR
+            - spend: 广告花费
+            - cpc: CPC
+            - vcpm: VCPM，按 viewable_impressions 计算
+            - sales: 广告总销售额
+            - acos: ACoS
             - roas: ROAS
+            - orders: 广告总订单量
+            - cvr: CVR
+            - cpa: CPA
+            - units_sold: 广告总销量
 
         Notes:
             该方法更适合做 ASIN 级别广告全局体检，
@@ -241,54 +421,44 @@ class AdsReportRepository:
         if not normalized_asin:
             return []
 
-        sql = """
-            WITH asin_campaign_data AS (
-                SELECT
-                    campaign_id,
-                    SUM(impressions) AS impressions,
-                    SUM(clicks) AS clicks,
-                    SUM(orders) AS orders,
-                    ROUND(SUM(spend), 4) AS spend,
-                    ROUND(SUM(sales), 4) AS sales
-                FROM
-                    amz_ad_rpt_ad
-                WHERE
-                    report_date BETWEEN :start_date AND :end_date
-                    AND UPPER(asin) = :asin
-                GROUP BY
-                    campaign_id
-            ),
-            campaign_names AS (
-                SELECT
-                    st.campaign_id,
-                    MAX(st.campaign_name) AS campaign_name
-                FROM
-                    amz_ad_rpt_search_term st
-                    INNER JOIN asin_campaign_data ad_data
-                        ON st.campaign_id = ad_data.campaign_id
-                WHERE
-                    st.report_date BETWEEN :start_date AND :end_date
-                GROUP BY
-                    st.campaign_id
-            )
+        sql = f"""
+            WITH {self.get_enabled_asin_campaign_scope_cte()}
             SELECT
-                ad_data.campaign_id,
-                campaign_names.campaign_name,
-                ad_data.impressions,
-                ad_data.clicks,
-                ad_data.orders,
-                ad_data.spend,
-                ad_data.sales,
-                ROUND(ad_data.spend / NULLIF(ad_data.sales, 0), 4) AS acos,
-                ROUND(ad_data.sales / NULLIF(ad_data.spend, 0), 4) AS roas
+                CASE
+                    WHEN MAX(UPPER(scope.state)) = 'ENABLED' THEN 1
+                    ELSE 0
+                END AS enabled,
+                scope.campaign_id,
+                MAX(scope.campaign_name) AS campaign_name,
+                COALESCE(MAX(rpt.ad_type), MAX(scope.ad_type)) AS ad_type,
+                MAX(scope.budget) AS budget,
+                SUM(rpt.impressions) AS impressions,
+                SUM(rpt.clicks) AS clicks,
+                ROUND(SUM(rpt.clicks) / NULLIF(SUM(rpt.impressions), 0), 6) AS ctr,
+                ROUND(SUM(rpt.spend), 4) AS spend,
+                ROUND(SUM(rpt.spend) / NULLIF(SUM(rpt.clicks), 0), 4) AS cpc,
+                ROUND(SUM(rpt.spend) / NULLIF(SUM(rpt.viewable_impressions), 0) * 1000, 4) AS vcpm,
+                ROUND(SUM(rpt.sales), 4) AS sales,
+                ROUND(SUM(rpt.spend) / NULLIF(SUM(rpt.sales), 0), 4) AS acos,
+                ROUND(SUM(rpt.sales) / NULLIF(SUM(rpt.spend), 0), 4) AS roas,
+                SUM(rpt.orders) AS orders,
+                ROUND(SUM(rpt.orders) / NULLIF(SUM(rpt.clicks), 0), 6) AS cvr,
+                ROUND(SUM(rpt.spend) / NULLIF(SUM(rpt.orders), 0), 4) AS cpa,
+                SUM(rpt.units_sold) AS units_sold
             FROM
-                asin_campaign_data ad_data
-                LEFT JOIN campaign_names
-                    ON ad_data.campaign_id = campaign_names.campaign_id
+                amz_ad_rpt_campaign rpt
+                INNER JOIN enabled_asin_campaign_scope scope
+                    ON rpt.profile_id = scope.profile_id
+                    AND rpt.campaign_id = scope.campaign_id
+            WHERE
+                rpt.report_date BETWEEN :start_date AND :end_date
+            GROUP BY
+                scope.profile_id,
+                scope.campaign_id
             ORDER BY
-                ad_data.clicks DESC,
-                ad_data.impressions DESC,
-                ad_data.campaign_id ASC
+                clicks DESC,
+                impressions DESC,
+                scope.campaign_id ASC
         """
         params = {
             "asin": normalized_asin,
@@ -297,113 +467,7 @@ class AdsReportRepository:
         }
         return self.pool.query(sql, params=params)
     
-    # 用户搜索词趋势
-    def get_target_data(
-        self,
-        target_type: str,
-        target_value: str,
-        start_date: DateLike,
-        end_date: DateLike,
-        time_granularity: TimeGranularity | str,
-    ) -> list[dict]:
-        """
-        查询指定投放目标在指定时间范围内的历史表现数据。
 
-        Args:
-            target_type: 投放目标类型，取值建议为 keyword 或 product。
-            target_value: 投放目标值。target_type 为 keyword 时传关键词文本，
-                target_type 为 product 时传商品 ASIN。
-            start_date: 开始日期，支持 str / date / datetime。
-            end_date: 结束日期，支持 str / date / datetime。
-            time_granularity: 时间粒度，支持 TimeGranularity 枚举或对应字符串。
-
-        Returns:
-            list[dict]: 投放目标表现数据列表。
-            每条记录建议至少包含以下字段：
-            - placement: 广告位，如 top_of_search / rest_of_search / product_pages
-            - bid: 历史 bid
-            - impressions: 曝光量
-            - clicks: 点击量
-            - orders: 订单量
-            - spend: 花费
-            - sales: 销售额
-            - cpc: CPC
-            - cvr: CVR
-            - acos: ACOS
-
-        Notes:
-            该方法对应 workflow 的“定位置定 bid”步骤：
-            - 有历史数据时，可基于不同 placement 的表现和历史 bid 做调价
-            - 没有历史数据时，可退化为使用位置平均转化率和售价倒推 bid
-        """
-        normalized_target_type = str(target_type).strip().lower()
-        normalized_target_value = str(target_value).strip()
-        normalized_start_date = self.normalize_date_input(start_date)
-        normalized_end_date = self.normalize_date_input(end_date)
-        period_expression = self.get_report_period_expression(
-            "cp.report_date",
-            time_granularity,
-        )
-
-        if not normalized_target_type or not normalized_target_value:
-            return []
-
-        if normalized_target_type == "keyword":
-            target_filter = "st.keyword_text = :target_value"
-            normalized_target_value_param = normalized_target_value
-        elif normalized_target_type == "product":
-            target_filter = """
-                (
-                    UPPER(st.keyword_text) = :target_value
-                    OR UPPER(st.query) = :target_value
-                )
-            """
-            normalized_target_value_param = normalized_target_value.upper()
-        else:
-            raise ValueError(f"不支持的投放目标类型: {target_type!r}")
-
-        sql = f"""
-            WITH target_campaign_scope AS (
-                SELECT DISTINCT
-                    st.profile_id,
-                    st.campaign_id
-                FROM
-                    amz_ad_rpt_search_term st
-                WHERE
-                    st.report_date BETWEEN :start_date AND :end_date
-                    AND {target_filter}
-            )
-            SELECT
-                {period_expression} AS report_date,
-                cp.placement,
-                SUM(cp.impressions) AS impressions,
-                SUM(cp.clicks) AS clicks,
-                SUM(cp.orders) AS orders,
-                ROUND(SUM(cp.spend), 4) AS spend,
-                ROUND(SUM(cp.sales), 4) AS sales,
-                ROUND(SUM(cp.spend) / NULLIF(SUM(cp.clicks), 0), 4) AS cpc,
-                ROUND(SUM(cp.orders) / NULLIF(SUM(cp.clicks), 0), 6) AS cvr,
-                ROUND(SUM(cp.spend) / NULLIF(SUM(cp.sales), 0), 4) AS acos
-            FROM
-                amz_ad_rpt_campaign_placement cp
-                INNER JOIN target_campaign_scope target_scope
-                    ON cp.profile_id = target_scope.profile_id
-                    AND cp.campaign_id = target_scope.campaign_id
-            WHERE
-                cp.report_date BETWEEN :start_date AND :end_date
-            GROUP BY
-                {period_expression},
-                cp.placement
-            ORDER BY
-                report_date ASC,
-                cp.placement ASC
-        """
-        params = {
-            "target_value": normalized_target_value_param,
-            "start_date": normalized_start_date,
-            "end_date": normalized_end_date,
-        }
-        return self.pool.query(sql, params=params)
     
     # 广告活动趋势
     def get_campaign_data(
@@ -423,16 +487,27 @@ class AdsReportRepository:
             time_granularity: 时间粒度，支持 TimeGranularity 枚举或对应字符串。
 
         Returns:
-            list[dict]: 广告活动汇总数据列表。
-            每条记录建议至少包含以下字段：
+            list[dict]: 广告活动趋势数据列表。
+            每条记录包含以下可用字段：
+            - report_date: 报表周期
+            - enabled: 是否有效
             - campaign_id: 广告活动 ID
+            - campaign_name: 广告活动名称
+            - ad_type: 广告类型
+            - budget: 预算
             - impressions: 曝光量
             - clicks: 点击量
-            - orders: 订单量
-            - spend: 花费
-            - sales: 销售额
-            - acos: ACOS
+            - ctr: CTR
+            - spend: 广告花费
+            - cpc: CPC
+            - vcpm: VCPM，按 viewable_impressions 计算
+            - sales: 广告总销售额
+            - acos: ACoS
             - roas: ROAS
+            - orders: 广告总订单量
+            - cvr: CVR
+            - cpa: CPA
+            - units_sold: 广告总销量
 
         Notes:
             该方法更适合 campaign 层级的预算、整体效果和结构分析，
@@ -442,7 +517,7 @@ class AdsReportRepository:
         normalized_start_date = self.normalize_date_input(start_date)
         normalized_end_date = self.normalize_date_input(end_date)
         period_expression = self.get_report_period_expression(
-            "report_date",
+            "rpt.report_date",
             time_granularity,
         )
 
@@ -452,24 +527,40 @@ class AdsReportRepository:
         sql = f"""
             SELECT
                 {period_expression} AS report_date,
-                campaign_id,
-                SUM(impressions) AS impressions,
-                SUM(clicks) AS clicks,
-                SUM(orders) AS orders,
-                ROUND(SUM(spend), 4) AS spend,
-                ROUND(SUM(sales), 4) AS sales,
-                ROUND(SUM(spend) / NULLIF(SUM(sales), 0), 4) AS acos,
-                ROUND(SUM(sales) / NULLIF(SUM(spend), 0), 4) AS roas
+                CASE
+                    WHEN MAX(UPPER(campaign.state)) = 'ENABLED' THEN 1
+                    ELSE 0
+                END AS enabled,
+                rpt.campaign_id,
+                MAX(campaign.campaign_name) AS campaign_name,
+                COALESCE(MAX(rpt.ad_type), MAX(campaign.ad_type)) AS ad_type,
+                MAX(campaign.budget) AS budget,
+                SUM(rpt.impressions) AS impressions,
+                SUM(rpt.clicks) AS clicks,
+                ROUND(SUM(rpt.clicks) / NULLIF(SUM(rpt.impressions), 0), 6) AS ctr,
+                ROUND(SUM(rpt.spend), 4) AS spend,
+                ROUND(SUM(rpt.spend) / NULLIF(SUM(rpt.clicks), 0), 4) AS cpc,
+                ROUND(SUM(rpt.spend) / NULLIF(SUM(rpt.viewable_impressions), 0) * 1000, 4) AS vcpm,
+                ROUND(SUM(rpt.sales), 4) AS sales,
+                ROUND(SUM(rpt.spend) / NULLIF(SUM(rpt.sales), 0), 4) AS acos,
+                ROUND(SUM(rpt.sales) / NULLIF(SUM(rpt.spend), 0), 4) AS roas,
+                SUM(rpt.orders) AS orders,
+                ROUND(SUM(rpt.orders) / NULLIF(SUM(rpt.clicks), 0), 6) AS cvr,
+                ROUND(SUM(rpt.spend) / NULLIF(SUM(rpt.orders), 0), 4) AS cpa,
+                SUM(rpt.units_sold) AS units_sold
             FROM
-                amz_ad_rpt_campaign
+                amz_ad_rpt_campaign rpt
+                LEFT JOIN amz_ad_campaign campaign
+                    ON rpt.profile_id = campaign.profile_id
+                    AND rpt.campaign_id = campaign.campaign_id
             WHERE
-                report_date BETWEEN :start_date AND :end_date
-                AND campaign_id = :campaign_id
+                rpt.report_date BETWEEN :start_date AND :end_date
+                AND rpt.campaign_id = :campaign_id
             GROUP BY
                 {period_expression},
-                campaign_id
+                rpt.campaign_id
             ORDER BY
-                report_date ASC
+                report_date DESC
         """
         params = {
             "campaign_id": normalized_campaign_id,

@@ -103,14 +103,36 @@
 
 - 查询指定 ASIN 在指定时间范围内的用户搜索词流量来源
 
-预期返回字段至少包括：
+返回字段：
 
-- `term_type`
 - `search_term`
+- `campaign_ad_group`
+- `impressions`
 - `clicks`
-- `orders`
+- `ctr`
 - `spend`
+- `cpc`
 - `sales`
+- `acos`
+- `roas`
+- `orders`
+- `cvr`
+- `cpa`
+- `units_sold`
+- `term_type`
+
+##### `get_target_data(...)`
+
+用途：
+
+- 查询指定搜索词/商品 ASIN 的历史趋势数据
+- 需要传入当前 ASIN，按 G+ 口径限定商品对应的 ENABLED 广告结构
+- 当同一搜索词命中多个广告活动/广告组时，趋势自动使用汇总列表排序最高的那条广告结构
+
+返回字段：
+
+- `report_date`
+- 与 `get_user_search_terms_by_asin(...)` 相同的搜索词维度字段
 
 ##### `get_asin_ads_data(...)`
 
@@ -118,18 +140,37 @@
 
 - 查询 ASIN 维度广告活动汇总数据
 
-##### `get_target_data(...)`
+返回字段：
 
-用途：
-
-- 查询投放目标（关键词/商品）的历史表现
-- 主要用于“定位置定 bid”
+- `enabled`
+- `campaign_id`
+- `campaign_name`
+- `ad_type`
+- `budget`
+- `impressions`
+- `clicks`
+- `ctr`
+- `spend`
+- `cpc`
+- `vcpm`
+- `sales`
+- `acos`
+- `roas`
+- `orders`
+- `cvr`
+- `cpa`
+- `units_sold`
 
 ##### `get_campaign_data(...)`
 
 用途：
 
-- 查询 campaign 级别的汇总表现
+- 查询 campaign 级别的历史趋势数据
+
+返回字段：
+
+- `report_date`
+- 与 `get_asin_ads_data(...)` 相同的广告活动维度字段
 
 #### 注意事项
 
