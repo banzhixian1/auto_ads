@@ -1,6 +1,8 @@
 from src.constants.metrics import HIGH_PERFORMANCE_EFFICIENCY
 from src.schemas.strategy import BidRecommendation
 
+DEFAULT_INITIAL_TARGET_ACOS = 0.40
+
 
 def recommend_bid(
     average_order_price: float | None,
@@ -20,13 +22,15 @@ def recommend_bid(
     # 没有历史 bid 时，用售价、目标 ACOS、预估转化率倒推可接受 CPC
     if (
         average_order_price is not None
-        and target_acos is not None
         and conversion_rate not in (None, 0)
     ):
-        max_cpc = average_order_price * target_acos * conversion_rate
+        effective_target_acos = (
+            target_acos if target_acos is not None else DEFAULT_INITIAL_TARGET_ACOS
+        )
+        max_cpc = average_order_price * effective_target_acos * conversion_rate
         return BidRecommendation(
             suggested_bid=round(max_cpc, 2),
-            reason="基于售价、目标 ACOS 和预估转化率倒推出价。",
+            reason="基于售价、目标 ACOS 和对应广告位平均转化率倒推出初始出价。",
         )
 
     # 信息不完整时只返回占位建议，不强行生成数字

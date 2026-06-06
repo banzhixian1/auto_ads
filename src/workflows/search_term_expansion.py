@@ -30,7 +30,7 @@ def run_search_term_expansion(
         start_date=request.start_date,
         end_date=request.end_date,
     )
-    report_keyword_terms, report_product_asins = ads_report_service.split_user_search_terms(user_search_term_rows)
+    _, report_product_asins = ads_report_service.split_user_search_terms(user_search_term_rows)
 
     # 第二步：先从报表里挑“数据好的词”和“数据好的商品 ASIN”
     high_value_terms = keyword_service.collect_seed_terms(
@@ -38,14 +38,12 @@ def run_search_term_expansion(
             *request.seed_search_terms,
             *ads_report_service.select_high_value_terms_by_strategy(
                 user_search_term_rows,
-                include_attempt_terms=intensity_config.include_attempt_terms,
             ),
         ],
         asin_terms=[],
     )
     high_value_asins = ads_report_service.select_high_value_product_asins_by_strategy(
         user_search_term_rows,
-        include_attempt_terms=intensity_config.include_attempt_terms,
     )
 
     # 如果用户搜索词里没有商品流量，则回退到竞品 ASIN
@@ -55,9 +53,9 @@ def run_search_term_expansion(
         else [asin for asin in request.competitor_asins if asin]
     )
 
-    # 第三步：构造种子词集合，保留人工输入词、报表高价值词、报表原始关键词
+    # 第三步：构造用于扩词的起始词集合
     seeds = keyword_service.collect_seed_terms(
-        manual_terms=[*request.seed_search_terms, *high_value_terms, *report_keyword_terms],
+        manual_terms=[*request.seed_search_terms, *high_value_terms],
         asin_terms=[],
     )
 
@@ -77,13 +75,9 @@ def run_search_term_expansion(
         report_granularity=request.report_granularity,
     )
 
-    # 第五步：把双链路候选词和种子词自身合并
-    seed_candidates = [
-        aba_service.build_keyword_candidate(term, source="seed_term")
-        for term in seeds
-    ]
+    # 第五步：候选池只接收第 3 步双链路产出，不直接纳入起始词自身
     candidates = keyword_service.merge_expanded_candidates(
-        [seed_candidates, term_chain_candidates, asin_chain_candidates]
+        [term_chain_candidates, asin_chain_candidates]
     )
 
     # 第六步：过滤不相关词
@@ -94,7 +88,12 @@ def run_search_term_expansion(
     )
     candidates = keyword_service.apply_rank_cutoff(
         candidates=candidates,
-        max_search_rank=intensity_config.max_search_rank,
+        keep_rank_percent=intensity_config.keep_rank_percent,
+    )
+    placement_rows = ads_report_service.get_placement_data(
+        asin=request.product_asin,
+        start_date=request.start_date,
+        end_date=request.end_date,
     )
 
     # 第七步：为每个候选词生成投放位置和 bid 建议
@@ -103,6 +102,7 @@ def run_search_term_expansion(
             candidate=candidate,
             average_order_price=request.average_order_price,
             target_acos=request.target_acos,
+            placement_rows=placement_rows,
         )
         for candidate in candidates
     ]

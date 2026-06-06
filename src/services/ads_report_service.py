@@ -21,6 +21,21 @@ class AdsReportService:
             end_date=end_date,
         )
 
+    def get_placement_data(
+        self,
+        asin: str,
+        start_date: DateLike,
+        end_date: DateLike,
+    ) -> list[dict]:
+        # 读取商品在不同广告位的历史汇总表现，用于未投词初始 bid 估算。
+        if self.repo is None or not asin or not start_date or not end_date:
+            return []
+        return self.repo.get_placement_data(
+            asin=asin,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
     def split_user_search_terms(
         self,
         rows: list[dict],
@@ -52,10 +67,10 @@ class AdsReportService:
     def select_high_value_terms_by_strategy(
         self,
         rows: list[dict],
-        include_attempt_terms: bool = True,
     ) -> list[str]:
-        # 根据拓词强度筛选高价值词。
+        # 根据报表聚合 ACOS 基线筛选高价值词。
         selected_terms: list[str] = []
+        average_acos = self.calculate_average_acos(rows)
         for row in rows:
             term_type = str(row.get("term_type", "")).strip().lower()
             if term_type != "keyword":
@@ -63,7 +78,10 @@ class AdsReportService:
             term_value = str(row.get("search_term", "")).strip()
             if not term_value:
                 continue
-            if self.is_high_value_row(row, include_attempt_terms=include_attempt_terms):
+            if self.is_high_value_row(
+                row,
+                average_acos=average_acos,
+            ):
                 selected_terms.append(term_value)
         return self.deduplicate_values(selected_terms)
 
@@ -74,10 +92,10 @@ class AdsReportService:
     def select_high_value_product_asins_by_strategy(
         self,
         rows: list[dict],
-        include_attempt_terms: bool = True,
     ) -> list[str]:
-        # 根据拓词强度筛选高价值商品入口。
+        # 根据报表聚合 ACOS 基线筛选高价值商品入口。
         selected_asins: list[str] = []
+        average_acos = self.calculate_average_acos(rows)
         for row in rows:
             term_type = str(row.get("term_type", "")).strip().lower()
             if term_type != "product":
@@ -85,21 +103,49 @@ class AdsReportService:
             term_value = str(row.get("search_term", "")).strip()
             if not term_value:
                 continue
-            if self.is_high_value_row(row, include_attempt_terms=include_attempt_terms):
+            if self.is_high_value_row(
+                row,
+                average_acos=average_acos,
+            ):
                 selected_asins.append(term_value)
         return self.deduplicate_values(selected_asins)
 
-    def is_high_value_row(self, row: dict, include_attempt_terms: bool = True) -> bool:
-        # 报表字段暂按最小假设处理：
-        # 1. 优先策略：有订单视为高价值
-        # 2. 尝试策略：没订单但有点击时，是否纳入由强度控制
-        orders = self.to_float(row.get("orders"))
-        clicks = self.to_float(row.get("clicks"))
-        if orders > 0:
-            return True
-        if include_attempt_terms and clicks > 0:
-            return True
-        return False
+    def calculate_average_acos(self, rows: list[dict]) -> float | None:
+        # 基线 ACOS 使用“所有用户搜索词的总花费 / 总销售额”。
+        total_spend = 0.0
+        total_sales = 0.0
+        for row in rows:
+            term_value = str(row.get("search_term", "")).strip()
+            if not term_value:
+                continue
+            total_spend += self.to_float(row.get("spend"))
+            total_sales += self.to_float(row.get("sales"))
+        if total_sales <= 0:
+            return None
+        return total_spend / total_sales
+
+    def is_high_value_row(
+        self,
+        row: dict,
+        average_acos: float | None = None,
+    ) -> bool:
+        # “数据好”定义为：单行 ACOS 低于全量用户搜索词的聚合 ACOS 基线。
+        if average_acos is None:
+            return False
+        row_acos = self.calculate_row_acos(row)
+        if row_acos is None:
+            return False
+        return row_acos < average_acos
+
+    def calculate_row_acos(self, row: dict) -> float | None:
+        spend = self.to_float(row.get("spend"))
+        sales = self.to_float(row.get("sales"))
+        if sales > 0:
+            return spend / sales
+        acos = self.to_float(row.get("acos"))
+        if acos > 0:
+            return acos
+        return None
 
 
     def deduplicate_values(self, values: list[str]) -> list[str]:

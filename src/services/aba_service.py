@@ -85,14 +85,9 @@ class AbaService:
     def find_high_conversion_asins(
         self,
         search_term: str,
-        report_date: DateLike | None = None,
-        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
     ) -> list[str]:
         # 给定一个高价值词，找其历史周数据中出现在前三的商品，
         # 再按商品维度做时间加权，筛出数据好的商品。
-        # report_date / report_granularity 当前未参与历史窗口截断，
-        # 保留该参数是为了兼容现有 workflow 调用签名，
-        # 后续如果要按某个周期截断历史窗口，可以在这里接入。
         history = self.get_search_term_history(search_term)
         if not history:
             return []
@@ -106,15 +101,14 @@ class AbaService:
             if self._is_high_value_asin(weighted_metrics):
                 asin_scores.append((asin, weighted_metrics))
 
-        asin_scores.sort(
-            key=lambda item: (
-                item[1]["efficiency"],
-                item[1]["weighted_conv_share"],
-                item[1]["weighted_click_share"],
-            ),
-            reverse=True,
-        )
-        return [asin for asin, _ in asin_scores]
+        if asin_scores:
+            asin_scores.sort(key=self._sort_key_for_asin_score, reverse=True)
+            return [asin for asin, _ in asin_scores]
+
+        fallback = self._select_fallback_top_click_asin(history)
+        if fallback is None:
+            return []
+        return [fallback]
 
     def _build_asin_histories(self, history: list[dict]) -> dict[str, list[dict]]:
         # 把每周前三商品展开成 ASIN 维度的历史份额轨迹。
@@ -133,6 +127,44 @@ class AbaService:
                     }
                 )
         return asin_histories
+
+    def _build_top_click_asin_histories(self, history: list[dict]) -> dict[str, list[dict]]:
+        # 兜底时只看每周点击排名第一的商品，优先拿体量更大的代表商品。
+        asin_histories: dict[str, list[dict]] = {}
+        for row in history:
+            asin = row.get("top_product_1_asin")
+            if not asin:
+                continue
+            asin_histories.setdefault(asin, []).append(
+                {
+                    "click_share": float(row.get("top_product_1_click_share", 0.0) or 0.0),
+                    "conversion_share": float(row.get("top_product_1_conversion_share", 0.0) or 0.0),
+                }
+            )
+        return asin_histories
+
+    def _select_fallback_top_click_asin(self, history: list[dict]) -> str | None:
+        top_click_histories = self._build_top_click_asin_histories(history)
+        if not top_click_histories:
+            return None
+
+        asin_scores: list[tuple[str, dict]] = []
+        for asin, metrics_history in top_click_histories.items():
+            weighted_metrics = self.calculate_weighted_metrics(metrics_history)
+            asin_scores.append((asin, weighted_metrics))
+
+        if not asin_scores:
+            return None
+        asin_scores.sort(key=self._sort_key_for_asin_score, reverse=True)
+        return asin_scores[0][0]
+
+    def _sort_key_for_asin_score(self, item: tuple[str, dict]) -> tuple[float, float, float]:
+        _, weighted_metrics = item
+        return (
+            weighted_metrics["efficiency"],
+            weighted_metrics["weighted_click_share"],
+            weighted_metrics["weighted_conv_share"],
+        )
 
     def _is_high_value_asin(self, weighted_metrics: dict) -> bool:
         # 数据好的商品定义：加权出单效率达到阈值。

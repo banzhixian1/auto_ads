@@ -18,8 +18,6 @@ class FakeAbaService:
     def find_high_conversion_asins(
         self,
         search_term: str,
-        report_date,
-        report_granularity: ReportGranularity | str = ReportGranularity.WEEK,
     ) -> list[str]:
         mapping = {
             "wireless mouse": ["B00TERM1"],
@@ -98,6 +96,13 @@ class FakeAdsReportService:
                 product_asins.append(row["search_term"])
         return keyword_terms, product_asins
 
+    def get_placement_data(self, asin: str, start_date: str, end_date: str) -> list[dict]:
+        return [
+            {"placement": "top_of_search", "cvr": 0.12},
+            {"placement": "rest_of_search", "cvr": 0.06},
+            {"placement": "product_pages", "cvr": 0.04},
+        ]
+
     def select_high_value_terms(self, rows: list[dict]) -> list[str]:
         return [row["search_term"] for row in rows if row["term_type"] == "keyword" and row.get("orders", 0) > 0]
 
@@ -107,26 +112,34 @@ class FakeAdsReportService:
     def select_high_value_terms_by_strategy(
         self,
         rows: list[dict],
-        include_attempt_terms: bool = True,
     ) -> list[str]:
         result = []
+        total_spend = sum(float(row.get("spend", 0) or 0) for row in rows if row.get("search_term"))
+        total_sales = sum(float(row.get("sales", 0) or 0) for row in rows if row.get("search_term"))
+        average_acos = (total_spend / total_sales) if total_sales > 0 else None
         for row in rows:
             if row["term_type"] != "keyword":
                 continue
-            if row.get("orders", 0) > 0 or (include_attempt_terms and row.get("clicks", 0) > 0):
+            sales = float(row.get("sales", 0) or 0)
+            spend = float(row.get("spend", 0) or 0)
+            if average_acos is not None and sales > 0 and (spend / sales) < average_acos:
                 result.append(row["search_term"])
         return result
 
     def select_high_value_product_asins_by_strategy(
         self,
         rows: list[dict],
-        include_attempt_terms: bool = True,
     ) -> list[str]:
         result = []
+        total_spend = sum(float(row.get("spend", 0) or 0) for row in rows if row.get("search_term"))
+        total_sales = sum(float(row.get("sales", 0) or 0) for row in rows if row.get("search_term"))
+        average_acos = (total_spend / total_sales) if total_sales > 0 else None
         for row in rows:
             if row["term_type"] != "product":
                 continue
-            if row.get("orders", 0) > 0 or (include_attempt_terms and row.get("clicks", 0) > 0):
+            sales = float(row.get("sales", 0) or 0)
+            spend = float(row.get("spend", 0) or 0)
+            if average_acos is not None and sales > 0 and (spend / sales) < average_acos:
                 result.append(row["search_term"])
         return result
 
@@ -151,8 +164,8 @@ class SearchTermExpansionWorkflowTestCase(unittest.TestCase):
             aba_service=FakeAbaService(),
             ads_report_service=FakeAdsReportService(
                 rows=[
-                    {"term_type": "keyword", "search_term": "wireless mouse", "orders": 3, "clicks": 10},
-                    {"term_type": "product", "search_term": "B001FLOW", "orders": 2, "clicks": 8, "search_rank": 1000},
+                    {"term_type": "keyword", "search_term": "wireless mouse", "orders": 3, "clicks": 10, "spend": 20, "sales": 100},
+                    {"term_type": "product", "search_term": "B001FLOW", "orders": 2, "clicks": 8, "search_rank": 1000, "spend": 10, "sales": 100},
                 ]
             ),
         )
@@ -185,16 +198,19 @@ class SearchTermExpansionWorkflowTestCase(unittest.TestCase):
             aba_service=FakeAbaService(),
             ads_report_service=FakeAdsReportService(
                 rows=[
-                    {"term_type": "keyword", "search_term": "wireless mouse", "orders": 1, "clicks": 5},
+                    {"term_type": "keyword", "search_term": "wireless mouse", "orders": 1, "clicks": 5, "spend": 10, "sales": 100},
+                    {"term_type": "keyword", "search_term": "bad mouse", "orders": 0, "clicks": 2, "spend": 80, "sales": 100},
                 ]
             ),
         )
 
         self.assertEqual(result.product_seed_asins, ["B000TEST", "B000TEST2"])
         self.assertIn("wireless mouse", result.seeds)
-        self.assertIn("bluetooth mouse", [candidate.term for candidate in result.candidates])
+        candidate_terms = [candidate.term for candidate in result.candidates]
+        self.assertIn("wireless mouse", candidate_terms)
+        self.assertIn("ergonomic mouse", candidate_terms)
 
-    def test_conservative_intensity_excludes_attempt_terms(self):
+    def test_second_step_is_independent_from_expansion_intensity(self):
         request = SearchTermExpansionRequest(
             report_date="2026-06-04",
             product_asin="B00SELF",
@@ -210,23 +226,23 @@ class SearchTermExpansionWorkflowTestCase(unittest.TestCase):
             aba_service=FakeAbaService(),
             ads_report_service=FakeAdsReportService(
                 rows=[
-                    {"term_type": "keyword", "search_term": "try mouse", "orders": 0, "clicks": 4, "search_rank": 5000},
-                    {"term_type": "keyword", "search_term": "buy mouse", "orders": 1, "clicks": 4, "search_rank": 5000},
-                    {"term_type": "product", "search_term": "B001TRY", "orders": 0, "clicks": 3, "search_rank": 5000},
+                    {"term_type": "keyword", "search_term": "good mouse", "spend": 10, "sales": 100, "search_rank": 5000},
+                    {"term_type": "keyword", "search_term": "bad mouse", "spend": 60, "sales": 100, "search_rank": 5000},
+                    {"term_type": "product", "search_term": "B001TRY", "spend": 50, "sales": 100, "search_rank": 5000},
                 ]
             ),
         )
 
-        self.assertEqual(result.high_value_terms, ["buy mouse"])
+        self.assertEqual(result.high_value_terms, ["good mouse"])
         self.assertEqual(result.product_seed_asins, [])
 
-    def test_aggressive_intensity_respects_rank_cap(self):
+    def test_conservative_intensity_keeps_top_rank_percent_candidates(self):
         request = SearchTermExpansionRequest(
             report_date="2026-06-04",
             product_asin="B00SELF",
             start_date="2026-05-01",
             end_date="2026-05-31",
-            expansion_intensity=ExpansionIntensity.AGGRESSIVE,
+            expansion_intensity=ExpansionIntensity.CONSERVATIVE,
             competitor_asins=["B000TEST"],
         )
 
@@ -235,16 +251,39 @@ class SearchTermExpansionWorkflowTestCase(unittest.TestCase):
             aba_service=FakeAbaService(),
             ads_report_service=FakeAdsReportService(
                 rows=[
-                    {"term_type": "keyword", "search_term": "rank ok", "orders": 0, "clicks": 2, "search_rank": 1_000_000},
-                    {"term_type": "keyword", "search_term": "rank too far", "orders": 3, "clicks": 5, "search_rank": 2_000_000},
+                    {"term_type": "keyword", "search_term": "wireless mouse", "spend": 10, "sales": 100, "search_rank": 1_000},
+                    {"term_type": "keyword", "search_term": "bad mouse", "spend": 90, "sales": 100, "search_rank": 2_000_000},
+                    {"term_type": "product", "search_term": "B001FLOW", "spend": 10, "sales": 100, "search_rank": 100},
                 ]
             ),
         )
 
-        self.assertIn("rank ok", result.high_value_terms)
-        self.assertIn("rank too far", result.high_value_terms)
-        self.assertIn("rank ok", [candidate.term for candidate in result.candidates])
-        self.assertNotIn("rank too far", [candidate.term for candidate in result.candidates])
+        self.assertEqual(result.high_value_terms, ["wireless mouse"])
+        self.assertEqual([candidate.term for candidate in result.candidates], ["wireless mouse"])
+
+    def test_report_raw_keyword_terms_do_not_enter_candidate_pool_directly(self):
+        request = SearchTermExpansionRequest(
+            report_date="2026-06-04",
+            product_asin="B00SELF",
+            start_date="2026-05-01",
+            end_date="2026-05-31",
+            product_title="Wireless ergonomic mouse",
+            product_features=["silent click", "usb receiver"],
+        )
+
+        result = run_search_term_expansion(
+            request=request,
+            aba_service=FakeAbaService(),
+            ads_report_service=FakeAdsReportService(
+                rows=[
+                    {"term_type": "keyword", "search_term": "bad mouse", "spend": 80, "sales": 100, "search_rank": 5000},
+                    {"term_type": "product", "search_term": "B001FLOW", "spend": 10, "sales": 100, "search_rank": 1000},
+                ]
+            ),
+        )
+
+        self.assertEqual(result.high_value_terms, [])
+        self.assertNotIn("bad mouse", [candidate.term for candidate in result.candidates])
 
 
 if __name__ == "__main__":

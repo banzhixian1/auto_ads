@@ -12,29 +12,19 @@ class ExpansionIntensity(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class ExpansionIntensityConfig:
-    # 参与高价值入口筛选的最大搜索排名
-    max_search_rank: int
-    # 目标候选词数量，用于后续动态扩词时作为停止条件
-    target_term_count: int
-    # 是否纳入“尝试型”入口
-    include_attempt_terms: bool
+    # 最终候选池按搜索排名保留的比例
+    keep_rank_percent: float
 
 
 EXPANSION_INTENSITY_CONFIGS: dict[ExpansionIntensity, ExpansionIntensityConfig] = {
     ExpansionIntensity.CONSERVATIVE: ExpansionIntensityConfig(
-        max_search_rank=200_000,
-        target_term_count=30,
-        include_attempt_terms=False,
+        keep_rank_percent=0.3,
     ),
     ExpansionIntensity.BALANCED: ExpansionIntensityConfig(
-        max_search_rank=500_000,
-        target_term_count=50,
-        include_attempt_terms=True,
+        keep_rank_percent=0.5,
     ),
     ExpansionIntensity.AGGRESSIVE: ExpansionIntensityConfig(
-        max_search_rank=1_500_000,
-        target_term_count=80,
-        include_attempt_terms=True,
+        keep_rank_percent=0.8,
     ),
 }
 

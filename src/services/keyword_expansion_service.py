@@ -1,3 +1,5 @@
+import math
+
 from src.schemas.keyword import KeywordCandidate
 from .aba_service import AbaService
 from src.utils.report_period import DateLike, ReportGranularity
@@ -37,8 +39,6 @@ class KeywordExpansionService:
             candidates.append(aba_service.build_keyword_candidate(term, source="high_value_term"))
             high_value_asins = aba_service.find_high_conversion_asins(
                 search_term=term,
-                report_date=report_date,
-                report_granularity=report_granularity,
             )
             for asin in high_value_asins:
                 for expanded_term in aba_service.reverse_lookup_terms_by_asin(
@@ -132,16 +132,20 @@ class KeywordExpansionService:
     def apply_rank_cutoff(
         self,
         candidates: list[KeywordCandidate],
-        max_search_rank: int | None,
+        keep_rank_percent: float | None,
     ) -> list[KeywordCandidate]:
-        # 在候选词汇总、去重、相关性过滤后，再按排名上限截断。
-        if max_search_rank is None:
+        # 在候选词汇总、去重、相关性过滤后，再按搜索排名分位截断。
+        if keep_rank_percent is None or not candidates:
             return candidates
-        filtered: list[KeywordCandidate] = []
-        for candidate in candidates:
-            if candidate.search_rank is None or candidate.search_rank <= max_search_rank:
-                filtered.append(candidate)
-        return filtered
+        keep_count = max(1, math.ceil(len(candidates) * keep_rank_percent))
+        ranked_candidates = sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.search_rank is None,
+                candidate.search_rank if candidate.search_rank is not None else float("inf"),
+            ),
+        )
+        return ranked_candidates[:keep_count]
 
     def is_candidate_relevant(self, term: str, context_text: str) -> bool:
         # 极简相关性判断：
