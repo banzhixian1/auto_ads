@@ -10,6 +10,7 @@ config/
 configs/
 data/
 archive/
+debug_search_term_expansion_outputs/
 
 # 打包相关
 build/
@@ -22,3 +23,4 @@ test.py
 test.ipynb
 temp.py
 temp.ipynb
+sp_rpt_test.json

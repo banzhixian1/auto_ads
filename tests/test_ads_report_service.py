@@ -40,6 +40,19 @@ class AdsReportServiceTestCase(unittest.TestCase):
 
         self.assertEqual(result, ["B001GOOD"])
 
+    def test_product_asins_are_normalized_to_uppercase(self):
+        rows = [
+            {"term_type": "keyword", "search_term": "term a", "spend": 10, "sales": 100},
+            {"term_type": "product", "search_term": "b001good", "spend": 20, "sales": 200},
+            {"term_type": "product", "search_term": "b001bad", "spend": 50, "sales": 100},
+        ]
+
+        _, product_asins = self.service.split_user_search_terms(rows)
+        high_value_asins = self.service.select_high_value_product_asins_by_strategy(rows)
+
+        self.assertEqual(product_asins, ["B001GOOD", "B001BAD"])
+        self.assertEqual(high_value_asins, ["B001GOOD"])
+
     def test_rows_without_sales_do_not_become_high_value(self):
         rows = [
             {"term_type": "keyword", "search_term": "good term", "spend": 10, "sales": 100},

@@ -1,10 +1,12 @@
 from enum import Enum
 from typing import Optional
-from datetime import date, datetime
+from datetime import date, datetime, time as datetime_time
+from src.constants.placements import PRODUCT_PAGES, REST_OF_SEARCH, TOP_OF_SEARCH
 from src.utils.db_conn_pool import create_mysql_pool, SQLAlchemyPool
 
 # 可选全局默认 pool
 DEFAULT_POOL = create_mysql_pool('dataiforce')
+DEFAULT_TRAFFIC_POOL = create_mysql_pool('am_advertise')
 
 DateLike = str | date | datetime
 
@@ -466,8 +468,150 @@ class AdsReportRepository:
             "end_date": normalized_end_date,
         }
         return self.pool.query(sql, params=params)
-    
 
+    # 广告位表现
+    def get_placement_data(
+        self,
+        asin: str,
+        start_date: DateLike,
+        end_date: DateLike,
+    ) -> list[dict]:
+        """
+        查询指定 ASIN 在不同广告位的历史汇总表现。
+
+        Returns:
+            list[dict]: 广告位维度汇总数据。
+            每条记录至少包含：
+            - placement: 规范化广告位，top_of_search / rest_of_search / product_pages
+            - impressions / clicks / spend / sales / orders
+            - ctr / cpc / acos / roas / cvr
+        """
+        normalized_asin = str(asin).strip().upper()
+        normalized_start_date = self.normalize_date_input(start_date)
+        normalized_end_date = self.normalize_date_input(end_date)
+
+        if not normalized_asin:
+            return []
+
+        sql = f"""
+            WITH {self.get_enabled_asin_campaign_scope_cte()},
+            normalized_placement_report AS (
+                SELECT
+                    rpt.profile_id,
+                    rpt.campaign_id,
+                    CASE
+                        WHEN LOWER(TRIM(rpt.placement)) IN ('top', 'top_of_search')
+                            OR LOWER(rpt.placement) REGEXP 'top.*search|search.*top'
+                            THEN '{TOP_OF_SEARCH}'
+                        WHEN LOWER(TRIM(rpt.placement)) IN ('page', 'product_page', 'product_pages', 'detail')
+                            OR LOWER(rpt.placement) REGEXP 'product.*page|detail'
+                            THEN '{PRODUCT_PAGES}'
+                        WHEN LOWER(TRIM(rpt.placement)) IN ('other', 'rest_of_search')
+                            OR LOWER(rpt.placement) REGEXP 'rest.*search|other.*search'
+                            THEN '{REST_OF_SEARCH}'
+                        ELSE '{REST_OF_SEARCH}'
+                    END AS placement,
+                    rpt.impressions,
+                    rpt.clicks,
+                    rpt.spend,
+                    rpt.orders,
+                    rpt.sales,
+                    rpt.units_sold
+                FROM
+                    amz_ad_rpt_campaign_placement rpt
+                WHERE
+                    rpt.report_date BETWEEN :start_date AND :end_date
+            )
+            SELECT
+                placement,
+                SUM(impressions) AS impressions,
+                SUM(clicks) AS clicks,
+                ROUND(SUM(clicks) / NULLIF(SUM(impressions), 0), 6) AS ctr,
+                ROUND(SUM(spend), 4) AS spend,
+                ROUND(SUM(spend) / NULLIF(SUM(clicks), 0), 4) AS cpc,
+                ROUND(SUM(sales), 4) AS sales,
+                ROUND(SUM(spend) / NULLIF(SUM(sales), 0), 4) AS acos,
+                ROUND(SUM(sales) / NULLIF(SUM(spend), 0), 4) AS roas,
+                SUM(orders) AS orders,
+                ROUND(SUM(orders) / NULLIF(SUM(clicks), 0), 6) AS cvr,
+                SUM(units_sold) AS units_sold
+            FROM
+                normalized_placement_report rpt
+                INNER JOIN enabled_asin_campaign_scope scope
+                    ON rpt.profile_id = scope.profile_id
+                    AND rpt.campaign_id = scope.campaign_id
+            GROUP BY
+                placement
+            ORDER BY
+                clicks DESC,
+                impressions DESC,
+                placement ASC
+        """
+        params = {
+            "asin": normalized_asin,
+            "start_date": normalized_start_date,
+            "end_date": normalized_end_date,
+        }
+        return self.pool.query(sql, params=params)
+
+    def get_placement_orders_and_clicks(
+        self,
+        asin: str,
+        start_date: DateLike,
+        end_date: DateLike,
+    ) -> list[dict]:
+        """
+        查询指定 ASIN 在广告位维度的订单量和点击量。
+
+        仅读取 amz_ad_rpt_campaign_placement 表中 placement 为
+        top / page / other 的数据。
+
+        Returns:
+            list[dict]: 广告位订单与点击汇总。
+            每条记录包含：
+            - placement: top / page / other
+            - orders: 广告订单量
+            - clicks: 点击量
+        """
+        normalized_asin = str(asin).strip().upper()
+        normalized_start_date = self.normalize_date_input(start_date)
+        normalized_end_date = self.normalize_date_input(end_date)
+
+        if not normalized_asin:
+            return []
+
+        sql = f"""
+            WITH {self.get_enabled_asin_campaign_scope_cte()}
+            SELECT
+                LOWER(TRIM(rpt.placement)) AS placement,
+                COALESCE(SUM(rpt.orders), 0) AS orders,
+                COALESCE(SUM(rpt.clicks), 0) AS clicks
+            FROM
+                amz_ad_rpt_campaign_placement rpt
+                INNER JOIN enabled_asin_campaign_scope scope
+                    ON rpt.profile_id = scope.profile_id
+                    AND rpt.campaign_id = scope.campaign_id
+                    AND rpt.ad_type = scope.ad_type
+            WHERE
+                rpt.report_date BETWEEN :start_date AND :end_date
+                AND LOWER(TRIM(rpt.placement)) IN ('top', 'page', 'other')
+            GROUP BY
+                LOWER(TRIM(rpt.placement))
+            ORDER BY
+                CASE LOWER(TRIM(rpt.placement))
+                    WHEN 'top' THEN 1
+                    WHEN 'page' THEN 2
+                    WHEN 'other' THEN 3
+                    ELSE 4
+                END
+        """
+        params = {
+            "asin": normalized_asin,
+            "start_date": normalized_start_date,
+            "end_date": normalized_end_date,
+        }
+        return self.pool.query(sql, params=params)
+    
     
     # 广告活动趋势
     def get_campaign_data(
@@ -568,3 +712,278 @@ class AdsReportRepository:
             "end_date": normalized_end_date,
         }
         return self.pool.query(sql, params=params)
+
+def get_clicks_by_campaign_and_time(rows: list[dict]) -> list[dict]:
+    """
+    根据多组 campaign_id / date / time 查询各自时间点后的点击量。
+    通过表 ams_sp_traffic 根据 date 和 time 条件查询出 campaign_id 对应的所有行数据并计算点击量。
+    
+    Args:
+        rows: 查询条件列表。每个元素包含：
+            - campaign_id: 广告活动 ID。
+            - date: 查询日期。
+            - time: 查询时间。
+        
+    Returns:
+        list[dict]: 按入参顺序返回，每条包含：
+            - campaign_id: 广告活动 ID
+            - date: 查询日期
+            - time: 查询小时
+            - clicks: 点击数
+    """
+    if not rows:
+        return []
+    if not isinstance(rows, list):
+        raise TypeError("rows 必须是 list[dict] 类型")
+
+    normalized_rows = []
+    campaign_start_dates = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise TypeError("rows 的每个元素必须是 dict 类型")
+
+        date_value = row.get("date")
+        if isinstance(date_value, datetime):
+            normalized_date_value = date_value.date()
+        elif isinstance(date_value, date):
+            normalized_date_value = date_value
+        elif isinstance(date_value, str):
+            normalized_date_value = date.fromisoformat(date_value)
+        else:
+            raise TypeError(f"不支持的日期类型: {type(date_value)!r}")
+
+        time_value = row.get("time")
+        if isinstance(time_value, bool):
+            raise TypeError("小时参数不能是 bool 类型")
+        if isinstance(time_value, datetime):
+            normalized_hour = time_value.hour
+        elif isinstance(time_value, datetime_time):
+            normalized_hour = time_value.hour
+        elif isinstance(time_value, int):
+            normalized_hour = time_value
+        elif isinstance(time_value, str):
+            normalized_time_value = time_value.strip()
+            if ":" in normalized_time_value:
+                normalized_time_value = normalized_time_value.split(":", 1)[0]
+            normalized_hour = int(normalized_time_value)
+        else:
+            raise TypeError(f"不支持的小时类型: {type(time_value)!r}")
+
+        if normalized_hour < 0 or normalized_hour > 23:
+            raise ValueError(f"小时参数必须在 0 到 23 之间: {normalized_hour!r}")
+
+        campaign_id = str(row.get("campaign_id", "")).strip()
+        normalized_rows.append(
+            {
+                "campaign_id": campaign_id,
+                "date": normalized_date_value.isoformat(),
+                "date_value": normalized_date_value,
+                "time": normalized_hour,
+            }
+        )
+        if campaign_id and (
+            campaign_id not in campaign_start_dates
+            or normalized_date_value < campaign_start_dates[campaign_id]
+        ):
+            campaign_start_dates[campaign_id] = normalized_date_value
+
+    source_rows = []
+    if campaign_start_dates:
+        where_parts = []
+        params = {}
+        for index, (campaign_id, start_date) in enumerate(campaign_start_dates.items()):
+            where_parts.append(
+                f"(campaign_id = :campaign_id_{index} AND biz_date >= :start_date_{index})"
+            )
+            params[f"campaign_id_{index}"] = campaign_id
+            params[f"start_date_{index}"] = start_date.isoformat()
+
+        sql = f"""
+            SELECT
+                campaign_id,
+                biz_date,
+                hour_of_day,
+                clicks
+            FROM
+                am_advertise.ams_sp_traffic
+            WHERE
+                {' OR '.join(where_parts)}
+            ORDER BY
+                campaign_id,
+                biz_date,
+                hour_of_day
+        """
+        source_rows = DEFAULT_TRAFFIC_POOL.query(sql, params=params)
+
+    results = []
+    for request_row in normalized_rows:
+        clicks = 0
+        for source_row in source_rows:
+            if str(source_row.get("campaign_id") or "") != request_row["campaign_id"]:
+                continue
+
+            source_date_value = source_row.get("biz_date")
+            if isinstance(source_date_value, datetime):
+                source_date = source_date_value.date()
+            elif isinstance(source_date_value, date):
+                source_date = source_date_value
+            else:
+                source_date = date.fromisoformat(str(source_date_value))
+
+            source_hour = source_row.get("hour_of_day")
+            if source_hour is None:
+                continue
+            source_hour = int(source_hour)
+            if source_date < request_row["date_value"]:
+                continue
+            if source_date == request_row["date_value"] and source_hour < request_row["time"]:
+                continue
+            clicks += int(source_row.get("clicks") or 0)
+
+        results.append(
+            {
+                "campaign_id": request_row["campaign_id"],
+                "date": request_row["date"],
+                "time": request_row["time"],
+                "clicks": clicks,
+            }
+        )
+    return results
+
+
+def get_odrers_by_campaign_and_time(rows: list[dict]) -> list[dict]:
+    """
+    根据多组 campaign_id / date / time 查询各自时间点后的订单量。
+    通过表 ams_sp_conversions 根据 date 和 time 条件查询出 campaign_id 对应的所有行数据attributed_conversions_7d列求和，计算订单量。
+    
+    Args:
+        rows: 查询条件列表。每个元素包含：
+            - campaign_id: 广告活动 ID。
+            - date: 查询日期。
+            - time: 查询时间。
+        
+    Returns:
+        list[dict]: 按入参顺序返回，每条包含：
+            - campaign_id: 广告活动 ID
+            - date: 查询日期
+            - time: 查询小时
+            - orders: 订单数
+    """
+    if not rows:
+        return []
+    if not isinstance(rows, list):
+        raise TypeError("rows 必须是 list[dict] 类型")
+
+    normalized_rows = []
+    campaign_start_dates = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise TypeError("rows 的每个元素必须是 dict 类型")
+
+        date_value = row.get("date")
+        if isinstance(date_value, datetime):
+            normalized_date_value = date_value.date()
+        elif isinstance(date_value, date):
+            normalized_date_value = date_value
+        elif isinstance(date_value, str):
+            normalized_date_value = date.fromisoformat(date_value)
+        else:
+            raise TypeError(f"不支持的日期类型: {type(date_value)!r}")
+
+        time_value = row.get("time")
+        if isinstance(time_value, bool):
+            raise TypeError("小时参数不能是 bool 类型")
+        if isinstance(time_value, datetime):
+            normalized_hour = time_value.hour
+        elif isinstance(time_value, datetime_time):
+            normalized_hour = time_value.hour
+        elif isinstance(time_value, int):
+            normalized_hour = time_value
+        elif isinstance(time_value, str):
+            normalized_time_value = time_value.strip()
+            if ":" in normalized_time_value:
+                normalized_time_value = normalized_time_value.split(":", 1)[0]
+            normalized_hour = int(normalized_time_value)
+        else:
+            raise TypeError(f"不支持的小时类型: {type(time_value)!r}")
+
+        if normalized_hour < 0 or normalized_hour > 23:
+            raise ValueError(f"小时参数必须在 0 到 23 之间: {normalized_hour!r}")
+
+        campaign_id = str(row.get("campaign_id", "")).strip()
+        normalized_rows.append(
+            {
+                "campaign_id": campaign_id,
+                "date": normalized_date_value.isoformat(),
+                "date_value": normalized_date_value,
+                "time": normalized_hour,
+            }
+        )
+        if campaign_id and (
+            campaign_id not in campaign_start_dates
+            or normalized_date_value < campaign_start_dates[campaign_id]
+        ):
+            campaign_start_dates[campaign_id] = normalized_date_value
+
+    source_rows = []
+    if campaign_start_dates:
+        where_parts = []
+        params = {}
+        for index, (campaign_id, start_date) in enumerate(campaign_start_dates.items()):
+            where_parts.append(
+                f"(campaign_id = :campaign_id_{index} AND biz_date >= :start_date_{index})"
+            )
+            params[f"campaign_id_{index}"] = campaign_id
+            params[f"start_date_{index}"] = start_date.isoformat()
+
+        sql = f"""
+            SELECT
+                campaign_id,
+                biz_date,
+                hour_of_day,
+                attributed_conversions_7d
+            FROM
+                am_advertise.ams_sp_conversions
+            WHERE
+                {' OR '.join(where_parts)}
+            ORDER BY
+                campaign_id,
+                biz_date,
+                hour_of_day
+        """
+        source_rows = DEFAULT_TRAFFIC_POOL.query(sql, params=params)
+
+    results = []
+    for request_row in normalized_rows:
+        orders = 0
+        for source_row in source_rows:
+            if str(source_row.get("campaign_id") or "") != request_row["campaign_id"]:
+                continue
+
+            source_date_value = source_row.get("biz_date")
+            if isinstance(source_date_value, datetime):
+                source_date = source_date_value.date()
+            elif isinstance(source_date_value, date):
+                source_date = source_date_value
+            else:
+                source_date = date.fromisoformat(str(source_date_value))
+
+            source_hour = source_row.get("hour_of_day")
+            if source_hour is None:
+                continue
+            source_hour = int(source_hour)
+            if source_date < request_row["date_value"]:
+                continue
+            if source_date == request_row["date_value"] and source_hour < request_row["time"]:
+                continue
+            orders += int(source_row.get("attributed_conversions_7d") or 0)
+
+        results.append(
+            {
+                "campaign_id": request_row["campaign_id"],
+                "date": request_row["date"],
+                "time": request_row["time"],
+                "orders": orders,
+            }
+        )
+    return results

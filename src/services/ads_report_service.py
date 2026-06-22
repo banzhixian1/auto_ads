@@ -56,7 +56,7 @@ class AdsReportService:
             if term_type == "keyword":
                 keyword_terms.append(term_value)
             elif term_type == "product":
-                product_asins.append(term_value)
+                product_asins.append(term_value.upper())
 
         return keyword_terms, product_asins
 
@@ -107,7 +107,7 @@ class AdsReportService:
                 row,
                 average_acos=average_acos,
             ):
-                selected_asins.append(term_value)
+                selected_asins.append(term_value.upper())
         return self.deduplicate_values(selected_asins)
 
     def calculate_average_acos(self, rows: list[dict]) -> float | None:
